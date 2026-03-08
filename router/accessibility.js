@@ -6,10 +6,11 @@ const authMiddleware = require('../middleware/auth');
 const { 
     processAccessibilityErrors, 
     generateSuggestions, 
-    generateCorrectedCode 
+    generateCorrectedCode,
+    receiveExtensionErrors
 } = require('../controllers/accessibilityController');
 
-// Configure multer for file uploads
+// Configure multer for MULTIPLE file uploads
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         cb(null, 'uploads/');
@@ -35,7 +36,7 @@ const fileFilter = (req, file, cb) => {
         'application/json',
         'application/zip',
         'application/x-zip-compressed',
-        'application/octet-stream' // For files without proper MIME type
+        'application/octet-stream' // For TypeScript/JSX files
     ];
     
     // Allowed extensions
@@ -51,13 +52,13 @@ const fileFilter = (req, file, cb) => {
     }
 };
 
-// Multer configuration with explicit busboy limits
+// Multer configuration for MULTIPLE files
 const upload = multer({
     storage: storage,
     limits: {
-        fileSize: 200 * 1024 * 1024, // 200MB in bytes
-        files: 1, // Only allow 1 file at a time
-        fields: 10, // Number of non-file fields
+        fileSize: 200 * 1024 * 1024, // 200MB per file
+        files: 50, // Allow up to 50 files at once
+        fields: 20, // Number of non-file fields
         parts: 100 // Total parts (files + fields)
     },
     fileFilter: fileFilter
@@ -65,38 +66,47 @@ const upload = multer({
 
 // Log configuration on startup
 console.log('Multer configured with:');
-console.log('- Max file size: 200MB');
-console.log('- Max files: 1');
+console.log('- Max file size: 200MB per file');
+console.log('- Max files: 50');
 console.log('- Storage: disk (uploads/)');
 
 /**
  * POST /api/accessibility/process
- * Main endpoint - Process accessibility errors with Claude AI
- * Accepts both suggestions and full-correction in one endpoint
+ * Main endpoint - Process accessibility errors with Gemini AI
+ * Supports MULTIPLE file uploads
  */
 router.post('/process', authMiddleware, (req, res, next) => {
     console.log('Processing accessibility request...');
     console.log('Content-Length:', req.headers['content-length']);
     next();
-}, upload.single('file'), processAccessibilityErrors);
+}, upload.array('files', 50), processAccessibilityErrors); // 'files' field, max 50
+
+/**
+ * POST /api/accessibility/extension-errors
+ * Receive errors from Chrome extension
+ * No auth required for extension
+ */
+router.post('/extension-errors', (req, res, next) => {
+    console.log('Received errors from extension');
+    next();
+}, receiveExtensionErrors);
 
 /**
  * POST /api/accessibility/suggestions
  * Get AI-powered suggestions only (no file upload needed)
- * Use this when you already have the code as string
  */
 router.post('/suggestions', authMiddleware, generateSuggestions);
 
 /**
  * POST /api/accessibility/correct
  * Get fully corrected code as ZIP file
- * Requires file upload
+ * Supports MULTIPLE files
  */
 router.post('/correct', authMiddleware, (req, res, next) => {
     console.log('Processing correction request...');
     console.log('Content-Length:', req.headers['content-length']);
     next();
-}, upload.single('file'), generateCorrectedCode);
+}, upload.array('files', 50), generateCorrectedCode);
 
 // Error handler specifically for multer errors on this route
 router.use((err, req, res, next) => {
@@ -108,20 +118,26 @@ router.use((err, req, res, next) => {
         if (err.code === 'LIMIT_FILE_SIZE') {
             return res.status(400).json({
                 success: false,
-                message: 'File size exceeds 200MB limit. Please upload a smaller file or compress it.',
+                message: 'File size exceeds 200MB limit. Please upload smaller files.',
                 error: 'FILE_TOO_LARGE',
-                maxSize: '200MB',
-                receivedSize: req.headers['content-length'] ? 
-                    `${(parseInt(req.headers['content-length']) / 1024 / 1024).toFixed(2)}MB` : 
-                    'Unknown'
+                maxSize: '200MB per file'
             });
         }
         
         if (err.code === 'LIMIT_FILE_COUNT') {
             return res.status(400).json({
                 success: false,
-                message: 'Too many files uploaded. Please upload only one file at a time.',
-                error: 'LIMIT_FILE_COUNT'
+                message: 'Too many files uploaded. Maximum 50 files at once.',
+                error: 'LIMIT_FILE_COUNT',
+                maxFiles: 50
+            });
+        }
+        
+        if (err.code === 'LIMIT_UNEXPECTED_FILE') {
+            return res.status(400).json({
+                success: false,
+                message: 'Unexpected field name. Use "files" for file uploads.',
+                error: 'UNEXPECTED_FIELD'
             });
         }
         
@@ -136,7 +152,7 @@ router.use((err, req, res, next) => {
     if (err.message === 'Invalid file type') {
         return res.status(400).json({
             success: false,
-            message: 'Invalid file type. Please upload HTML, CSS, JS, or ZIP files only.',
+            message: 'Invalid file type. Please upload HTML, CSS, JS, TS, JSX, TSX, or ZIP files only.',
             error: 'INVALID_FILE_TYPE'
         });
     }

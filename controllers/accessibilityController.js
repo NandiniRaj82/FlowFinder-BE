@@ -13,179 +13,100 @@ const MAX_PROCESSABLE_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 /**
  * Main controller for processing accessibility errors with Gemini AI
+ * Supports multiple file uploads
  */
 const processAccessibilityErrors = async (req, res) => {
     let extractedDir = null;
     
     try {
         const { errors, choice } = req.body;
-        const file = req.file;
+        const files = req.files; // Multiple files
 
-        console.log('Processing file:', file ? file.originalname : 'none', 'Size:', file ? file.size : 0);
+        console.log('Processing files:', files ? files.length : 0);
 
-        if (!file) {
+        if (!files || files.length === 0) {
             return res.status(400).json({
                 success: false,
-                message: 'No file uploaded'
+                message: 'No files uploaded'
             });
         }
 
-        if (!errors) {
-            return res.status(400).json({
-                success: false,
-                message: 'No accessibility errors provided'
-            });
-        }
-
-        // Parse errors if string
-        const parsedErrors = typeof errors === 'string' ? JSON.parse(errors) : errors;
-
-        // Check if file is a ZIP
-        const isZip = file.mimetype === 'application/zip' || 
-                      file.mimetype === 'application/x-zip-compressed' ||
-                      file.originalname.toLowerCase().endsWith('.zip');
-
-        if (isZip) {
-            console.log('Detected ZIP file, extracting...');
-            
-            // Extract ZIP to temporary directory
-            const timestamp = Date.now();
-            extractedDir = path.join('uploads', `extracted-${timestamp}`);
-            await fs.mkdir(extractedDir, { recursive: true });
-
-            await extractZipFile(file.path, extractedDir);
-            
-            // Find HTML files in extracted directory
-            const htmlFiles = await findHtmlFiles(extractedDir);
-            
-            if (htmlFiles.length === 0) {
-                throw new Error('No HTML files found in ZIP archive');
-            }
-
-            console.log(`Found ${htmlFiles.length} HTML files to process`);
-
-            if (choice === 'suggestions') {
-                // Process first HTML file for suggestions
-                const firstHtmlPath = htmlFiles[0];
-                const fileContent = await fs.readFile(firstHtmlPath, 'utf-8');
-                
-                const suggestions = await generateAccessibilitySuggestions(fileContent, parsedErrors);
-                
-                // Clean up
-                await cleanupFiles(file.path, extractedDir);
-
-                return res.status(200).json({
-                    success: true,
-                    suggestions,
-                    fileName: path.basename(firstHtmlPath),
-                    totalFilesInZip: htmlFiles.length
-                });
-                
-            } else if (choice === 'full-correction') {
-                // Process all HTML files and create corrected ZIP
-                const correctedFiles = [];
-                
-                for (const htmlPath of htmlFiles) {
-                    console.log(`Processing: ${path.basename(htmlPath)}`);
-                    const fileContent = await fs.readFile(htmlPath, 'utf-8');
-                    const correctedCode = await generateCorrectedCodeWithGemini(fileContent, parsedErrors);
-                    
-                    correctedFiles.push({
-                        originalPath: htmlPath,
-                        relativePath: path.relative(extractedDir, htmlPath),
-                        correctedContent: correctedCode
-                    });
-                }
-
-                // Create ZIP with all corrected files
-                const zipPath = await createZipWithMultipleFiles(
-                    file.originalname,
-                    correctedFiles,
-                    parsedErrors,
-                    extractedDir
-                );
-
-                // Send ZIP file
-                res.download(zipPath, `corrected-${file.originalname}`, async (err) => {
-                    await cleanupFiles(file.path, extractedDir, zipPath);
-                    
-                    if (err) {
-                        console.error('Download error:', err);
-                    }
-                });
-            } else {
-                await cleanupFiles(file.path, extractedDir);
-                return res.status(400).json({
-                    success: false,
-                    message: 'Invalid choice. Must be "suggestions" or "full-correction"'
-                });
-            }
-
+        // Parse errors - could come from extension or form
+        let parsedErrors = [];
+        
+        if (errors) {
+            parsedErrors = typeof errors === 'string' ? JSON.parse(errors) : errors;
         } else {
-            // Handle single file (not ZIP)
-            console.log('Processing single file...');
+            // If no errors provided, generate a generic accessibility check request
+            parsedErrors = [{
+                type: 'general-accessibility',
+                message: 'Perform general accessibility audit',
+                impact: 'moderate'
+            }];
+        }
+
+        console.log('Errors to process:', parsedErrors.length);
+
+        // Process multiple files
+        const processedFiles = [];
+        
+        for (const file of files) {
+            console.log(`Processing: ${file.originalname} (${(file.size / 1024).toFixed(2)}KB)`);
             
-            // Check file size
-            const stats = await fs.stat(file.path);
-            if (stats.size > MAX_PROCESSABLE_FILE_SIZE) {
-                await fs.unlink(file.path);
-                return res.status(400).json({
-                    success: false,
-                    message: `Single file is too large to process. Maximum size: ${MAX_PROCESSABLE_FILE_SIZE / 1024 / 1024}MB`,
-                    actualSize: `${(stats.size / 1024 / 1024).toFixed(2)}MB`
-                });
-            }
+            // Check if it's a ZIP file
+            const isZip = file.mimetype === 'application/zip' || 
+                          file.mimetype === 'application/x-zip-compressed' ||
+                          file.originalname.toLowerCase().endsWith('.zip');
 
-            const fileContent = await fs.readFile(file.path, 'utf-8');
-
-            if (choice === 'suggestions') {
-                const suggestions = await generateAccessibilitySuggestions(fileContent, parsedErrors);
-                await fs.unlink(file.path);
-
-                return res.status(200).json({
-                    success: true,
-                    suggestions,
-                    fileName: file.originalname
-                });
-                
-            } else if (choice === 'full-correction') {
-                const correctedCode = await generateCorrectedCodeWithGemini(fileContent, parsedErrors);
-                const zipPath = await createZipWithCorrectedCode(
-                    file.originalname, 
-                    correctedCode,
-                    parsedErrors
-                );
-
-                res.download(zipPath, `corrected-${file.originalname}.zip`, async (err) => {
-                    await cleanupFiles(file.path, null, zipPath);
-                    
-                    if (err) {
-                        console.error('Download error:', err);
-                    }
-                });
+            if (isZip) {
+                // Extract and process ZIP
+                const zipResults = await processZipFile(file, parsedErrors, choice);
+                processedFiles.push(...zipResults);
             } else {
-                await fs.unlink(file.path);
-                return res.status(400).json({
-                    success: false,
-                    message: 'Invalid choice. Must be "suggestions" or "full-correction"'
-                });
+                // Process single file
+                const result = await processSingleFile(file, parsedErrors, choice);
+                processedFiles.push(result);
             }
+        }
+
+        // Based on choice, return appropriate response
+        if (choice === 'suggestions') {
+            // Return all suggestions
+            await cleanupUploadedFiles(files);
+            
+            return res.status(200).json({
+                success: true,
+                results: processedFiles,
+                totalFiles: processedFiles.length
+            });
+            
+        } else if (choice === 'full-correction') {
+            // Create a single ZIP with all corrected files
+            const zipPath = await createCombinedCorrectedZip(processedFiles, parsedErrors);
+            
+            res.download(zipPath, `corrected-files-${Date.now()}.zip`, async (err) => {
+                // Clean up
+                await cleanupUploadedFiles(files);
+                await fs.unlink(zipPath).catch(() => {});
+                
+                if (err) {
+                    console.error('Download error:', err);
+                }
+            });
+        } else {
+            await cleanupUploadedFiles(files);
+            return res.status(400).json({
+                success: false,
+                message: 'Invalid choice. Must be "suggestions" or "full-correction"'
+            });
         }
 
     } catch (error) {
         console.error('Process accessibility errors:', error);
         
         // Clean up on error
-        if (req.file) {
-            try {
-                await fs.unlink(req.file.path).catch(() => {});
-            } catch (e) {}
-        }
-        
-        if (extractedDir) {
-            try {
-                await fs.rm(extractedDir, { recursive: true, force: true }).catch(() => {});
-            } catch (e) {}
+        if (req.files) {
+            await cleanupUploadedFiles(req.files);
         }
 
         res.status(500).json({
@@ -193,6 +114,172 @@ const processAccessibilityErrors = async (req, res) => {
             message: 'Error processing accessibility errors',
             error: error.message
         });
+    }
+};
+
+/**
+ * Process a single uploaded file
+ */
+const processSingleFile = async (file, errors, choice) => {
+    try {
+        // Check file size
+        if (file.size > MAX_PROCESSABLE_FILE_SIZE) {
+            return {
+                fileName: file.originalname,
+                error: `File too large (max ${MAX_PROCESSABLE_FILE_SIZE / 1024 / 1024}MB)`,
+                success: false
+            };
+        }
+
+        const fileContent = await fs.readFile(file.path, 'utf-8');
+
+        if (choice === 'suggestions') {
+            const suggestions = await generateAccessibilitySuggestions(fileContent, errors);
+            
+            return {
+                fileName: file.originalname,
+                suggestions,
+                success: true
+            };
+        } else {
+            const correctedCode = await generateCorrectedCodeWithGemini(fileContent, errors);
+            
+            return {
+                fileName: file.originalname,
+                correctedCode,
+                success: true
+            };
+        }
+    } catch (error) {
+        console.error(`Error processing ${file.originalname}:`, error);
+        return {
+            fileName: file.originalname,
+            error: error.message,
+            success: false
+        };
+    }
+};
+
+/**
+ * Process ZIP file
+ */
+const processZipFile = async (file, errors, choice) => {
+    const timestamp = Date.now();
+    const extractedDir = path.join('uploads', `extracted-${timestamp}`);
+    
+    try {
+        await fs.mkdir(extractedDir, { recursive: true });
+        await extractZipFile(file.path, extractedDir);
+        
+        // Find HTML files
+        const htmlFiles = await findHtmlFiles(extractedDir);
+        
+        if (htmlFiles.length === 0) {
+            return [{
+                fileName: file.originalname,
+                error: 'No HTML files found in ZIP',
+                success: false
+            }];
+        }
+
+        const results = [];
+        
+        for (const htmlPath of htmlFiles) {
+            const content = await fs.readFile(htmlPath, 'utf-8');
+            const relativePath = path.relative(extractedDir, htmlPath);
+            
+            if (choice === 'suggestions') {
+                const suggestions = await generateAccessibilitySuggestions(content, errors);
+                results.push({
+                    fileName: relativePath,
+                    suggestions,
+                    success: true
+                });
+            } else {
+                const correctedCode = await generateCorrectedCodeWithGemini(content, errors);
+                results.push({
+                    fileName: relativePath,
+                    correctedCode,
+                    success: true
+                });
+            }
+        }
+        
+        // Clean up extracted directory
+        await fs.rm(extractedDir, { recursive: true, force: true });
+        
+        return results;
+        
+    } catch (error) {
+        console.error(`Error processing ZIP ${file.originalname}:`, error);
+        
+        // Clean up on error
+        if (extractedDir) {
+            await fs.rm(extractedDir, { recursive: true, force: true }).catch(() => {});
+        }
+        
+        return [{
+            fileName: file.originalname,
+            error: error.message,
+            success: false
+        }];
+    }
+};
+
+/**
+ * Create combined ZIP with all corrected files
+ */
+const createCombinedCorrectedZip = async (processedFiles, errors) => {
+    return new Promise((resolve, reject) => {
+        try {
+            const timestamp = Date.now();
+            const zipPath = path.join('uploads', `corrected-${timestamp}.zip`);
+            const output = fsSync.createWriteStream(zipPath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+
+            output.on('close', () => resolve(zipPath));
+            archive.on('error', (err) => reject(err));
+            archive.pipe(output);
+
+            // Add all corrected files
+            processedFiles.forEach((file, index) => {
+                if (file.success && file.correctedCode) {
+                    const ext = path.extname(file.fileName) || '.html';
+                    const baseName = path.basename(file.fileName, ext);
+                    archive.append(file.correctedCode, { 
+                        name: `${baseName}-corrected${ext}` 
+                    });
+                }
+            });
+
+            // Add changelog
+            archive.append(createChangelog(errors, processedFiles), { 
+                name: 'CHANGELOG.md' 
+            });
+
+            // Add README
+            archive.append(createReadme(processedFiles.length), { 
+                name: 'README.md' 
+            });
+
+            archive.finalize();
+            
+        } catch (error) {
+            reject(error);
+        }
+    });
+};
+
+/**
+ * Clean up uploaded files
+ */
+const cleanupUploadedFiles = async (files) => {
+    for (const file of files) {
+        try {
+            await fs.unlink(file.path);
+        } catch (error) {
+            console.error(`Error deleting ${file.path}:`, error.message);
+        }
     }
 };
 
@@ -222,7 +309,7 @@ const findHtmlFiles = async (dir) => {
             
             if (item.isDirectory()) {
                 await scan(fullPath);
-            } else if (item.isFile() && /\.html?$/i.test(item.name)) {
+            } else if (item.isFile() && /\.(html|htm|jsx|tsx|js|ts)$/i.test(item.name)) {
                 files.push(fullPath);
             }
         }
@@ -233,35 +320,14 @@ const findHtmlFiles = async (dir) => {
 };
 
 /**
- * Clean up files and directories
- */
-const cleanupFiles = async (...paths) => {
-    for (const p of paths) {
-        if (!p) continue;
-        
-        try {
-            const stats = await fs.stat(p);
-            if (stats.isDirectory()) {
-                await fs.rm(p, { recursive: true, force: true });
-            } else {
-                await fs.unlink(p);
-            }
-        } catch (error) {
-            console.error(`Error cleaning up ${p}:`, error.message);
-        }
-    }
-};
-
-/**
  * Generate AI-powered suggestions using Gemini
  */
 const generateAccessibilitySuggestions = async (code, errors) => {
     try {
-        // Get the Gemini 2.5 Flash model (FREE tier available)
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
         // Truncate code if too long
-        const maxCodeLength = 30000; // ~30KB
+        const maxCodeLength = 30000;
         const truncatedCode = code.length > maxCodeLength 
             ? code.substring(0, maxCodeLength) + '\n... (code truncated)'
             : code;
@@ -285,11 +351,10 @@ const generateAccessibilitySuggestions = async (code, errors) => {
  */
 const generateCorrectedCodeWithGemini = async (code, errors) => {
     try {
-        // Get the Gemini 2.5 Flash model
         const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
         // Truncate code if too long
-        const maxCodeLength = 30000; // ~30KB
+        const maxCodeLength = 30000;
         const truncatedCode = code.length > maxCodeLength 
             ? code.substring(0, maxCodeLength) + '\n... (rest of code omitted)'
             : code;
@@ -312,42 +377,37 @@ const generateCorrectedCodeWithGemini = async (code, errors) => {
  * Create prompt for getting suggestions
  */
 const createSuggestionsPrompt = (code, errors) => {
-    const errorSummary = errors.slice(0, 20).map((err, idx) => // Limit to 20 errors
-        `${idx + 1}. ${err.type}: ${err.message}\n` +
+    const errorSummary = errors.slice(0, 20).map((err, idx) =>
+        `${idx + 1}. ${err.type || 'Issue'}: ${err.message || 'Accessibility issue'}\n` +
         `   Element: ${err.selector || err.element || 'N/A'}\n` +
         `   Impact: ${err.impact || 'N/A'}`
     ).join('\n\n');
 
-    return `You are an expert web accessibility consultant. I need your help to fix accessibility issues.
+    return `You are an expert web accessibility consultant. Analyze this code for accessibility issues.
 
-**ACCESSIBILITY ERRORS (showing first 20):**
+**ACCESSIBILITY ERRORS:**
 ${errorSummary}
 
-**CODE SAMPLE:**
-\`\`\`html
+**CODE:**
+\`\`\`
 ${code}
 \`\`\`
 
 **INSTRUCTIONS:**
-Provide detailed suggestions for the top 5 most critical accessibility errors. For each error:
+Provide top 5 critical accessibility fixes as JSON:
 
-1. Explain the problem clearly
-2. Show how to fix it with code example
-3. Provide WCAG reference
-
-Format your response as a JSON array:
 [
   {
     "errorNumber": 1,
-    "errorType": "missing-alt-text",
-    "severity": "critical",
-    "explanation": "Clear explanation of the problem",
-    "codeExample": "Fixed code snippet",
-    "wcagReference": "WCAG 2.1 Level A 1.1.1"
+    "errorType": "issue-name",
+    "severity": "critical|serious|moderate",
+    "explanation": "What's wrong",
+    "codeExample": "How to fix",
+    "wcagReference": "WCAG 2.1 reference"
   }
 ]
 
-Make your suggestions practical and beginner-friendly.`;
+Be practical and clear.`;
 };
 
 /**
@@ -355,31 +415,29 @@ Make your suggestions practical and beginner-friendly.`;
  */
 const createCorrectionPrompt = (code, errors) => {
     const errorSummary = errors.slice(0, 20).map((err, idx) =>
-        `${idx + 1}. ${err.type}: ${err.message}`
+        `${idx + 1}. ${err.type || 'Issue'}: ${err.message || 'Fix needed'}`
     ).join('\n');
 
-    return `You are an expert web accessibility engineer. Fix ALL accessibility issues in this code.
+    return `Fix ALL accessibility issues in this code.
 
-**ERRORS TO FIX:**
+**ERRORS:**
 ${errorSummary}
 
-**ORIGINAL CODE:**
-\`\`\`html
+**CODE:**
+\`\`\`
 ${code}
 \`\`\`
 
 **REQUIREMENTS:**
-1. Fix ALL accessibility errors listed above
-2. Maintain existing functionality and styling
-3. Follow WCAG 2.1 Level AA guidelines
-4. Add proper ARIA labels where needed
-5. Use semantic HTML
+- Fix all errors
+- Follow WCAG 2.1 AA
+- Add ARIA labels
+- Use semantic HTML
+- Maintain functionality
 
-**IMPORTANT:**
-Return ONLY the corrected code in a code block. No explanations outside the code block.
-
-\`\`\`html
-[your corrected code here]
+Return ONLY corrected code in code block:
+\`\`\`
+[corrected code]
 \`\`\``;
 };
 
@@ -388,7 +446,6 @@ Return ONLY the corrected code in a code block. No explanations outside the code
  */
 const parseSuggestionsResponse = (responseText, originalErrors) => {
     try {
-        // Try to extract JSON from response
         const jsonMatch = responseText.match(/\[[\s\S]*\]/);
         if (jsonMatch) {
             return JSON.parse(jsonMatch[0]);
@@ -409,7 +466,7 @@ const parseSuggestionsResponse = (responseText, originalErrors) => {
  * Extract corrected code from Gemini's response
  */
 const extractCorrectedCode = (responseText) => {
-    const codeBlockRegex = /```(?:html|javascript|css)?\n([\s\S]*?)\n```/;
+    const codeBlockRegex = /```(?:html|javascript|jsx|tsx|css)?\n([\s\S]*?)\n```/;
     const match = responseText.match(codeBlockRegex);
     
     if (match && match[1]) {
@@ -419,84 +476,26 @@ const extractCorrectedCode = (responseText) => {
 };
 
 /**
- * Create ZIP with single corrected file
- */
-const createZipWithCorrectedCode = async (originalFileName, correctedCode, errors) => {
-    return new Promise(async (resolve, reject) => {
-        try {
-            const timestamp = Date.now();
-            const zipPath = path.join('uploads', `corrected-${timestamp}.zip`);
-            const output = fsSync.createWriteStream(zipPath);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-
-            output.on('close', () => resolve(zipPath));
-            archive.on('error', (err) => reject(err));
-            archive.pipe(output);
-
-            const fileExtension = path.extname(originalFileName);
-            const baseName = path.basename(originalFileName, fileExtension);
-            archive.append(correctedCode, { name: `${baseName}-corrected${fileExtension}` });
-            archive.append(createChangelog(errors), { name: 'CHANGELOG.md' });
-            archive.append(createReadme(originalFileName), { name: 'README.md' });
-
-            await archive.finalize();
-        } catch (error) {
-            reject(error);
-        }
-    });
-};
-
-/**
- * Create ZIP with multiple corrected files
- */
-const createZipWithMultipleFiles = async (originalZipName, correctedFiles, errors, extractedDir) => {
-    return new Promise(async (resolve, reject) => {
-        try {
-            const timestamp = Date.now();
-            const zipPath = path.join('uploads', `corrected-${timestamp}.zip`);
-            const output = fsSync.createWriteStream(zipPath);
-            const archive = archiver('zip', { zlib: { level: 9 } });
-
-            output.on('close', () => resolve(zipPath));
-            archive.on('error', (err) => reject(err));
-            archive.pipe(output);
-
-            // Add corrected files
-            for (const file of correctedFiles) {
-                const correctedPath = file.relativePath.replace('.html', '-corrected.html');
-                archive.append(file.correctedContent, { name: correctedPath });
-            }
-
-            // Add other files from ZIP (CSS, JS, images, etc.)
-            archive.directory(extractedDir, false, (entry) => {
-                // Skip HTML files (already added as corrected)
-                return !/\.html?$/i.test(entry.name);
-            });
-
-            // Add documentation
-            archive.append(createChangelog(errors), { name: 'CHANGELOG.md' });
-            archive.append(createReadme(originalZipName), { name: 'README.md' });
-
-            await archive.finalize();
-        } catch (error) {
-            reject(error);
-        }
-    });
-};
-
-/**
  * Create changelog
  */
-const createChangelog = (errors) => {
+const createChangelog = (errors, processedFiles) => {
     const date = new Date().toISOString().split('T')[0];
     
     let changelog = `# Accessibility Fixes\n\n`;
     changelog += `Date: ${date}\n`;
+    changelog += `Files Processed: ${processedFiles.length}\n`;
     changelog += `Total Issues: ${errors.length}\n\n`;
 
+    changelog += `## Files Fixed\n\n`;
+    processedFiles.forEach((file, idx) => {
+        if (file.success) {
+            changelog += `${idx + 1}. ${file.fileName} ✓\n`;
+        }
+    });
+
+    changelog += `\n## Issues Addressed\n\n`;
     errors.slice(0, 20).forEach((err, idx) => {
-        changelog += `${idx + 1}. ${err.type || 'Issue'}\n`;
-        changelog += `   ${err.message}\n\n`;
+        changelog += `${idx + 1}. ${err.type || 'Issue'}: ${err.message || 'Fixed'}\n`;
     });
 
     return changelog;
@@ -505,23 +504,64 @@ const createChangelog = (errors) => {
 /**
  * Create README
  */
-const createReadme = (originalFileName) => {
+const createReadme = (fileCount) => {
     return `# Corrected Code Package
 
-Original: ${originalFileName}
 Generated by Flow Finder using Google Gemini AI
 
 ## Contents
-- Corrected HTML files
-- Original CSS/JS/assets
-- This README
+- ${fileCount} corrected file(s)
 - CHANGELOG with fixes
+- This README
+
+## What Was Done
+All files analyzed for accessibility issues and corrected following WCAG 2.1 AA guidelines.
 
 ## Next Steps
 1. Review corrected files
 2. Test in your application
-3. Verify accessibility improvements
+3. Run accessibility tests
+4. Deploy when ready
+
+---
+Powered by Gemini AI
 `;
+};
+
+/**
+ * Endpoint to receive errors from Chrome extension
+ */
+const receiveExtensionErrors = async (req, res) => {
+    try {
+        const { errors, tabId, url } = req.body;
+
+        if (!errors || !Array.isArray(errors)) {
+            return res.status(400).json({
+                success: false,
+                message: 'Errors array is required'
+            });
+        }
+
+        console.log(`Received ${errors.length} errors from extension for tab ${tabId}`);
+
+        // Store errors temporarily (could use Redis or database)
+        // For now, return them to be sent with file upload
+        return res.status(200).json({
+            success: true,
+            message: `Received ${errors.length} accessibility errors`,
+            errorCount: errors.length,
+            // Instruction for user
+            nextStep: 'Upload your files to get corrections'
+        });
+
+    } catch (error) {
+        console.error('Error receiving extension data:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error processing extension errors',
+            error: error.message
+        });
+    }
 };
 
 /**
@@ -561,30 +601,34 @@ const generateSuggestions = async (req, res) => {
 const generateCorrectedCode = async (req, res) => {
     try {
         const { errors } = req.body;
-        const file = req.file;
+        const files = req.files;
 
-        if (!file) {
+        if (!files || files.length === 0) {
             return res.status(400).json({
                 success: false,
-                message: 'No file uploaded'
-            });
-        }
-
-        if (!errors) {
-            return res.status(400).json({
-                success: false,
-                message: 'No errors provided'
+                message: 'No files uploaded'
             });
         }
 
         const parsedErrors = typeof errors === 'string' ? JSON.parse(errors) : errors;
-        const fileContent = await fs.readFile(file.path, 'utf-8');
 
-        const correctedCode = await generateCorrectedCodeWithGemini(fileContent, parsedErrors);
-        const zipPath = await createZipWithCorrectedCode(file.originalname, correctedCode, parsedErrors);
+        // Process all files
+        const results = [];
+        for (const file of files) {
+            const fileContent = await fs.readFile(file.path, 'utf-8');
+            const correctedCode = await generateCorrectedCodeWithGemini(fileContent, parsedErrors);
+            results.push({
+                fileName: file.originalname,
+                correctedCode
+            });
+        }
 
-        res.download(zipPath, `corrected-${file.originalname}.zip`, async (err) => {
-            await cleanupFiles(file.path, null, zipPath);
+        // Create ZIP
+        const zipPath = await createCombinedCorrectedZip(results, parsedErrors);
+
+        res.download(zipPath, `corrected-files.zip`, async (err) => {
+            await cleanupUploadedFiles(files);
+            await fs.unlink(zipPath).catch(() => {});
             
             if (err) {
                 console.error('Download error:', err);
@@ -594,8 +638,8 @@ const generateCorrectedCode = async (req, res) => {
     } catch (error) {
         console.error('Generate corrected code error:', error);
         
-        if (req.file) {
-            await cleanupFiles(req.file.path);
+        if (req.files) {
+            await cleanupUploadedFiles(req.files);
         }
 
         res.status(500).json({
@@ -609,5 +653,6 @@ const generateCorrectedCode = async (req, res) => {
 module.exports = {
     processAccessibilityErrors,
     generateSuggestions,
-    generateCorrectedCode
+    generateCorrectedCode,
+    receiveExtensionErrors
 };
