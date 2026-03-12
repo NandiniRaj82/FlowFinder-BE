@@ -50,7 +50,10 @@ app.use((req, res, next) => {
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/accessibility', accessibilityRoutes);
-
+app.use('/api/match-design', (req, res, next) => {
+  res.setTimeout(120000); // 2 minutes
+  next();
+}, require('./router/matchDesignRoute'));
 // Health check route
 app.get('/api/health', (req, res) => {
     res.status(200).json({ 
