@@ -54,7 +54,7 @@ app.use('/api/match-design', (req, res, next) => {
   res.setTimeout(120000); // 2 minutes
   next();
 }, require('./router/matchDesignRoute'));
-// Health check route
+app.use('/api/redesign', require('./router/designSuggesterRoute'));
 app.get('/api/health', (req, res) => {
     res.status(200).json({ 
         success: true, 
