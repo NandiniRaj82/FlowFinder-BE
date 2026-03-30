@@ -4,18 +4,13 @@ const axios = require('axios');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// ── Extract Figma file key from any figma.com URL ─────────────────────────
 function extractFigmaFileKey(url) {
-  // Handles:
-  //   https://www.figma.com/design/FILEKEY/...
-  //   https://www.figma.com/file/FILEKEY/...
-  //   https://www.figma.com/proto/FILEKEY/...
+
   const match = url.match(/figma\.com\/(?:design|file|proto)\/([a-zA-Z0-9]+)/);
   if (!match) throw new Error('Invalid Figma URL. Please use a figma.com/design/... share link.');
   return match[1];
 }
 
-// ── Screenshot the live website using Puppeteer ───────────────────────────
 async function screenshotWebsite(url) {
   let browser;
   try {
@@ -29,7 +24,6 @@ async function screenshotWebsite(url) {
     await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
     await new Promise(r => setTimeout(r, 2000));
 
-    // Scroll through page to trigger lazy loading
     await page.evaluate(async () => {
       await new Promise(resolve => {
         let totalHeight = 0;
@@ -51,7 +45,7 @@ async function screenshotWebsite(url) {
     const screenshot = await page.screenshot({
       type: 'jpeg',
       quality: 90,
-      fullPage: true  // ← capture entire page not just viewport
+      fullPage: true 
     });
 
     return screenshot.toString('base64');
@@ -60,11 +54,9 @@ async function screenshotWebsite(url) {
   }
 }
 
-// ── Fetch Figma design thumbnail via Figma API ────────────────────────────
 async function fetchFigmaImage(figmaUrl, figmaToken) {
   const fileKey = extractFigmaFileKey(figmaUrl);
 
-  // Get file metadata to find the first page/frame
   const fileRes = await axios.get(`https://api.figma.com/v1/files/${fileKey}`, {
     headers: { 'X-Figma-Token': figmaToken },
     timeout: 15000
@@ -72,13 +64,11 @@ async function fetchFigmaImage(figmaUrl, figmaToken) {
 
   const file = fileRes.data;
 
-  // Get the first top-level frame node ID
   const firstPage = file.document.children[0];
   const firstFrame = firstPage?.children?.[0];
 
   if (!firstFrame) throw new Error('No frames found in Figma file.');
 
-  // Export that frame as an image
   const imgRes = await axios.get(
     `https://api.figma.com/v1/images/${fileKey}?ids=${firstFrame.id}&format=jpg&scale=1`,
     {
@@ -90,14 +80,12 @@ async function fetchFigmaImage(figmaUrl, figmaToken) {
   const imageUrl = imgRes.data.images[firstFrame.id];
   if (!imageUrl) throw new Error('Could not export Figma frame as image.');
 
-  // Download the image and convert to base64
   const imgDownload = await axios.get(imageUrl, { responseType: 'arraybuffer', timeout: 20000 });
   return Buffer.from(imgDownload.data).toString('base64');
 }
 
-// ── Send both images to Gemini Vision for comparison ─────────────────────
 async function compareWithGemini(websiteBase64, figmaBase64, websiteUrl) {
-  const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+  const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
 const prompt = `You are a pixel-perfect UI/UX design reviewer with 10+ years of experience.
 
@@ -158,7 +146,6 @@ IMPORTANT RULES:
 
   const text = result.response.text();
 
-  // Parse JSON from response
   try {
     const jsonMatch = text.match(/\[[\s\S]*\]/);
     if (jsonMatch) return JSON.parse(jsonMatch[0]);
@@ -177,7 +164,6 @@ IMPORTANT RULES:
   }
 }
 
-// ── Main controller ───────────────────────────────────────────────────────
 const matchDesign = async (req, res) => {
   const { websiteUrl, figmaUrl } = req.body;
 
