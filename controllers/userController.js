@@ -1,12 +1,10 @@
 const User = require('../models/user');
 const jwt = require('jsonwebtoken');
 
-// Sign Up Controller
 const signup = async (req, res) => {
     try {
         const { fullName, email, password } = req.body;
 
-        // Check if user already exists
         const existingUser = await User.findOne({ email });
         if (existingUser) {
             return res.status(400).json({
@@ -15,7 +13,6 @@ const signup = async (req, res) => {
             });
         }
 
-        // Create new user
         const user = new User({
             fullName,
             email,
@@ -24,7 +21,6 @@ const signup = async (req, res) => {
 
         await user.save();
 
-        // Generate JWT token
         const token = jwt.sign(
             { userId: user._id, email: user.email },
             process.env.JWT_SECRET,
@@ -52,12 +48,10 @@ const signup = async (req, res) => {
     }
 };
 
-// Sign In Controller
 const signin = async (req, res) => {
     try {
         const { email, password } = req.body;
 
-        // Check if user exists
         const user = await User.findOne({ email });
         if (!user) {
             return res.status(401).json({
@@ -66,7 +60,6 @@ const signin = async (req, res) => {
             });
         }
 
-        // Verify password
         const isPasswordValid = await user.comparePassword(password);
         if (!isPasswordValid) {
             return res.status(401).json({
@@ -75,7 +68,6 @@ const signin = async (req, res) => {
             });
         }
 
-        // Generate JWT token
         const token = jwt.sign(
             { userId: user._id, email: user.email },
             process.env.JWT_SECRET,

@@ -3,7 +3,6 @@ const puppeteer = require('puppeteer');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
-// ── Scrape full page content ──────────────────────────────────────────────
 async function scrapePageContent(url) {
   let browser;
   try {
@@ -17,50 +16,41 @@ async function scrapePageContent(url) {
     await new Promise(r => setTimeout(r, 2000));
 
     const content = await page.evaluate(() => {
-      // Helper to clean text
       const clean = t => (t || '').replace(/\s+/g, ' ').trim();
 
-      // Nav links
       const navLinks = Array.from(document.querySelectorAll('nav a, header a'))
         .map(a => ({ text: clean(a.innerText), href: a.getAttribute('href') || '#' }))
         .filter(a => a.text.length > 0 && a.text.length < 40)
         .slice(0, 10);
 
-      // Hero / above-fold content
       const h1s = Array.from(document.querySelectorAll('h1')).map(h => clean(h.innerText)).filter(Boolean).slice(0, 3);
       const h2s = Array.from(document.querySelectorAll('h2')).map(h => clean(h.innerText)).filter(Boolean).slice(0, 8);
       const h3s = Array.from(document.querySelectorAll('h3')).map(h => clean(h.innerText)).filter(Boolean).slice(0, 10);
 
-      // Paragraphs
       const paras = Array.from(document.querySelectorAll('p'))
         .map(p => clean(p.innerText))
         .filter(p => p.length > 30)
         .slice(0, 12);
 
-      // Buttons / CTAs
       const ctas = Array.from(document.querySelectorAll('button, a.btn, a[class*="button"], a[class*="cta"]'))
         .map(b => clean(b.innerText))
         .filter(b => b.length > 0 && b.length < 50)
         .slice(0, 6);
 
-      // Lists
       const lists = Array.from(document.querySelectorAll('ul, ol'))
         .map(ul => Array.from(ul.querySelectorAll('li')).map(li => clean(li.innerText)).filter(Boolean).slice(0, 6))
         .filter(l => l.length > 0)
         .slice(0, 4);
 
-      // Meta
       const title       = document.title || '';
       const description = document.querySelector('meta[name="description"]')?.content || '';
       const logo        = document.querySelector('header img, nav img, .logo img')?.src || '';
 
-      // Computed colors
       const body         = document.body;
       const bodyStyle    = window.getComputedStyle(body);
       const primaryBg    = bodyStyle.backgroundColor;
       const primaryColor = bodyStyle.color;
 
-      // All section headings with their paragraphs (for sections)
       const sections = [];
       document.querySelectorAll('section, [class*="section"], main > div').forEach(sec => {
         const heading = sec.querySelector('h1,h2,h3')?.innerText?.trim();
@@ -77,7 +67,6 @@ async function scrapePageContent(url) {
       };
     });
 
-    // Screenshot for thumbnail
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
     content.screenshotBase64 = screenshot.toString('base64');
 
@@ -87,7 +76,6 @@ async function scrapePageContent(url) {
   }
 }
 
-// ── Generate HTML for one style ───────────────────────────────────────────
 async function generateStyledHTML(content, style, url) {
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
@@ -164,10 +152,8 @@ CRITICAL: Return ONLY the complete HTML document starting with <!DOCTYPE html>. 
   const result = await model.generateContent(prompt);
   let html = result.response.text();
 
-  // Strip markdown code blocks if present
   html = html.replace(/^```html\n?/i, '').replace(/^```\n?/, '').replace(/\n?```$/, '').trim();
 
-  // Ensure it starts with DOCTYPE
   if (!html.startsWith('<!DOCTYPE') && !html.startsWith('<html')) {
     const docStart = html.indexOf('<!DOCTYPE');
     if (docStart > -1) html = html.slice(docStart);
@@ -176,7 +162,6 @@ CRITICAL: Return ONLY the complete HTML document starting with <!DOCTYPE html>. 
   return { style, styleName: guide.name, html };
 }
 
-// ── Main controller ───────────────────────────────────────────────────────
 const redesignWebsite = async (req, res) => {
   const { websiteUrl } = req.body;
 
@@ -189,7 +174,6 @@ const redesignWebsite = async (req, res) => {
     const content = await scrapePageContent(websiteUrl);
     console.log('[Redesigner] Scraped:', content.title, '| Sections:', content.sections.length);
 
-    // Generate all 3 styles in parallel
     console.log('[Redesigner] Generating 3 redesign styles...');
     const [minimalResult, boldResult, colorfulResult] = await Promise.all([
       generateStyledHTML(content, 'minimal', websiteUrl),
