@@ -3,197 +3,427 @@ const puppeteer = require('puppeteer');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// ── Full page screenshot ──────────────────────────────────────────────────
+async function screenshotWebsite(url) {
+  let browser;
+  try {
+    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 1440, height: 900 });
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 40000 });
+    await new Promise(r => setTimeout(r, 4000));
+    await autoScroll(page);
+    await new Promise(r => setTimeout(r, 2000));
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
+    return screenshot.toString('base64');
+  } finally { if (browser) await browser.close(); }
+}
+
+async function autoScroll(page) {
+  await page.evaluate(async () => {
+    await new Promise(resolve => {
+      let total = 0;
+      const timer = setInterval(() => {
+        window.scrollBy(0, 200);
+        total += 200;
+        if (total >= document.body.scrollHeight) { clearInterval(timer); window.scrollTo(0, 0); resolve(); }
+      }, 60);
+    });
+  });
+}
+
+// ── Deep content scrape — gets EVERYTHING ────────────────────────────────
 async function scrapePageContent(url) {
   let browser;
   try {
-    browser = await puppeteer.launch({
-      headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
-    });
+    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
     const page = await browser.newPage();
     await page.setViewport({ width: 1440, height: 900 });
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 30000 });
+    await page.goto(url, { waitUntil: 'networkidle0', timeout: 40000 });
+    await new Promise(r => setTimeout(r, 4000));
+    await autoScroll(page);
     await new Promise(r => setTimeout(r, 2000));
 
     const content = await page.evaluate(() => {
       const clean = t => (t || '').replace(/\s+/g, ' ').trim();
+      const isVisible = el => {
+        const s = window.getComputedStyle(el);
+        return s.display !== 'none' && s.visibility !== 'hidden' && s.opacity !== '0' && el.offsetParent !== null;
+      };
 
-      const navLinks = Array.from(document.querySelectorAll('nav a, header a'))
-        .map(a => ({ text: clean(a.innerText), href: a.getAttribute('href') || '#' }))
-        .filter(a => a.text.length > 0 && a.text.length < 40)
-        .slice(0, 10);
-
-      const h1s = Array.from(document.querySelectorAll('h1')).map(h => clean(h.innerText)).filter(Boolean).slice(0, 3);
-      const h2s = Array.from(document.querySelectorAll('h2')).map(h => clean(h.innerText)).filter(Boolean).slice(0, 8);
-      const h3s = Array.from(document.querySelectorAll('h3')).map(h => clean(h.innerText)).filter(Boolean).slice(0, 10);
-
-      const paras = Array.from(document.querySelectorAll('p'))
-        .map(p => clean(p.innerText))
-        .filter(p => p.length > 30)
-        .slice(0, 12);
-
-      const ctas = Array.from(document.querySelectorAll('button, a.btn, a[class*="button"], a[class*="cta"]'))
-        .map(b => clean(b.innerText))
-        .filter(b => b.length > 0 && b.length < 50)
-        .slice(0, 6);
-
-      const lists = Array.from(document.querySelectorAll('ul, ol'))
-        .map(ul => Array.from(ul.querySelectorAll('li')).map(li => clean(li.innerText)).filter(Boolean).slice(0, 6))
-        .filter(l => l.length > 0)
-        .slice(0, 4);
-
-      const title       = document.title || '';
+      // Meta
+      const title = document.title || '';
       const description = document.querySelector('meta[name="description"]')?.content || '';
-      const logo        = document.querySelector('header img, nav img, .logo img')?.src || '';
 
-      const body         = document.body;
-      const bodyStyle    = window.getComputedStyle(body);
-      const primaryBg    = bodyStyle.backgroundColor;
-      const primaryColor = bodyStyle.color;
+      // Logo/brand
+      const logoText = clean(
+        document.querySelector('.logo, [class*="logo"], [class*="brand"], nav .name, header .name')?.innerText ||
+        document.querySelector('header h1, header a:first-child')?.innerText || ''
+      );
 
+      // Nav links — ALL of them
+      const navLinks = Array.from(document.querySelectorAll('nav a, header nav a, [role="navigation"] a'))
+        .filter(a => isVisible(a))
+        .map(a => ({ text: clean(a.innerText), href: a.getAttribute('href') || '#' }))
+        .filter(a => a.text.length > 0 && a.text.length < 60)
+        .reduce((acc, cur) => { if (!acc.find(x => x.text === cur.text)) acc.push(cur); return acc; }, []);
+
+      // ALL headings — every single one
+      const h1s = Array.from(document.querySelectorAll('h1')).map(h => clean(h.innerText)).filter(Boolean);
+      const h2s = Array.from(document.querySelectorAll('h2')).map(h => clean(h.innerText)).filter(Boolean);
+      const h3s = Array.from(document.querySelectorAll('h3')).map(h => clean(h.innerText)).filter(Boolean);
+      const h4s = Array.from(document.querySelectorAll('h4')).map(h => clean(h.innerText)).filter(Boolean);
+
+      // ALL paragraphs
+      const paras = Array.from(document.querySelectorAll('p'))
+        .filter(p => isVisible(p))
+        .map(p => clean(p.innerText))
+        .filter(p => p.length > 10);
+
+      // ALL list items — EVERY single one (tech stack, projects, etc.)
+      const allListItems = Array.from(document.querySelectorAll('li'))
+        .filter(li => isVisible(li))
+        .map(li => clean(li.innerText))
+        .filter(li => li.length > 1 && li.length < 300);
+
+      // ALL buttons and CTAs
+      const ctas = Array.from(document.querySelectorAll('button, a[href], [role="button"]'))
+        .filter(b => isVisible(b))
+        .map(b => clean(b.innerText))
+        .filter(b => b.length > 0 && b.length < 80)
+        .reduce((acc, cur) => { if (!acc.includes(cur)) acc.push(cur); return acc; }, [])
+        .slice(0, 20);
+
+      // ALL spans and divs with short meaningful text (catches tech stack badges, skill tags etc.)
+      const badges = Array.from(document.querySelectorAll('span, .badge, .tag, .chip, .skill, .tech, [class*="badge"], [class*="tag"], [class*="chip"], [class*="skill"], [class*="tech"], [class*="stack"]'))
+        .filter(el => isVisible(el))
+        .map(el => clean(el.innerText))
+        .filter(t => t.length > 1 && t.length < 40)
+        .reduce((acc, cur) => { if (!acc.includes(cur)) acc.push(cur); return acc; }, [])
+        .slice(0, 60);
+
+      // Build sections from the DOM structure
       const sections = [];
-      document.querySelectorAll('section, [class*="section"], main > div').forEach(sec => {
-        const heading = sec.querySelector('h1,h2,h3')?.innerText?.trim();
-        const text    = Array.from(sec.querySelectorAll('p')).map(p => clean(p.innerText)).filter(p => p.length > 20).slice(0, 2).join(' ');
-        const items   = Array.from(sec.querySelectorAll('li')).map(li => clean(li.innerText)).filter(Boolean).slice(0, 5);
-        if (heading) sections.push({ heading: clean(heading), text, items });
+      const sectionEls = document.querySelectorAll('section, [id], [class*="section"], [class*="hero"], [class*="about"], [class*="projects"], [class*="skills"], [class*="experience"], [class*="contact"], [class*="work"], [class*="portfolio"]');
+
+      sectionEls.forEach(sec => {
+        const id = sec.id || sec.className?.toString()?.split(' ')[0] || '';
+        const headings = Array.from(sec.querySelectorAll('h1,h2,h3,h4')).map(h => clean(h.innerText)).filter(Boolean);
+        const texts    = Array.from(sec.querySelectorAll('p')).filter(p => isVisible(p)).map(p => clean(p.innerText)).filter(p => p.length > 10);
+        const items    = Array.from(sec.querySelectorAll('li')).filter(li => isVisible(li)).map(li => clean(li.innerText)).filter(t => t.length > 1);
+        const btns     = Array.from(sec.querySelectorAll('button, a[href]')).filter(b => isVisible(b)).map(b => clean(b.innerText)).filter(b => b.length > 0 && b.length < 60);
+        const tags     = Array.from(sec.querySelectorAll('span, .badge, .tag, .chip')).filter(el => isVisible(el)).map(el => clean(el.innerText)).filter(t => t.length > 1 && t.length < 30);
+
+        if (headings.length > 0 || texts.length > 0 || items.length > 0) {
+          sections.push({ id, headings, texts, items, buttons: btns, tags });
+        }
       });
 
+      // Footer
+      const footerEl = document.querySelector('footer');
+      const footerHeadings = footerEl ? Array.from(footerEl.querySelectorAll('h1,h2,h3,h4,h5')).map(h => clean(h.innerText)).filter(Boolean) : [];
+      const footerTexts    = footerEl ? Array.from(footerEl.querySelectorAll('p')).map(p => clean(p.innerText)).filter(Boolean) : [];
+      const footerLinks    = footerEl ? Array.from(footerEl.querySelectorAll('a')).map(a => clean(a.innerText)).filter(Boolean) : [];
+
       return {
-        title, description, logo,
-        navLinks, h1s, h2s, h3s, paras, ctas, lists,
-        sections: sections.slice(0, 8),
-        primaryBg, primaryColor
+        title, description, logoText,
+        navLinks, h1s, h2s, h3s, h4s,
+        paras, allListItems, badges, ctas,
+        sections: sections.slice(0, 20),
+        footer: { headings: footerHeadings, texts: footerTexts, links: footerLinks },
       };
     });
 
-    const screenshot = await page.screenshot({ type: 'jpeg', quality: 70, fullPage: false });
-    content.screenshotBase64 = screenshot.toString('base64');
-
     return content;
-  } finally {
-    if (browser) await browser.close();
-  }
+  } finally { if (browser) await browser.close(); }
 }
 
-async function generateStyledHTML(content, style, url) {
+// ── Build exhaustive content reference ────────────────────────────────────
+function buildContentReference(content, url) {
+  const lines = [];
+  lines.push(`=== WEBSITE CONTENT TO USE VERBATIM ===`);
+  lines.push(`NOTE: The labels like (heading), (paragraph), (button) below are instructions for YOU only.`);
+  lines.push(`Do NOT include any labels, brackets, or reference numbers in the HTML output.`);
+  lines.push(`Only output the actual text values shown after each label.`);
+  lines.push('');
+  lines.push(`Page Title: ${content.title}`);
+  lines.push(`Brand/Logo name: ${content.logoText || content.title}`);
+  lines.push('');
+
+  lines.push(`NAVIGATION LINKS — use these exact texts as nav items:`);
+  content.navLinks.forEach(n => lines.push(`  - ${n.text}`));
+  lines.push('');
+
+  lines.push(`H1 HEADING — use as main hero heading:`);
+  content.h1s.forEach(h => lines.push(`  "${h}"`));
+  lines.push('');
+
+  lines.push(`H2 HEADINGS — use as section titles:`);
+  content.h2s.forEach(h => lines.push(`  "${h}"`));
+  lines.push('');
+
+  lines.push(`H3 HEADINGS — use as sub-section titles:`);
+  content.h3s.forEach(h => lines.push(`  "${h}"`));
+  lines.push('');
+
+  if (content.h4s.length > 0) {
+    lines.push(`H4 HEADINGS:`);
+    content.h4s.forEach(h => lines.push(`  "${h}"`));
+    lines.push('');
+  }
+
+  lines.push(`PARAGRAPHS — use all ${content.paras.length} of these as body text:`);
+  content.paras.forEach(p => lines.push(`  "${p}"`));
+  lines.push('');
+
+  lines.push(`LIST ITEMS — include ALL ${content.allListItems.length} items (do not skip any):`);
+  content.allListItems.forEach(li => lines.push(`  - ${li}`));
+  lines.push('');
+
+  if (content.badges.length > 0) {
+    lines.push(`TECH STACK / SKILL BADGES — display ALL ${content.badges.length} as badge/tag elements:`);
+    content.badges.forEach(b => lines.push(`  - ${b}`));
+    lines.push('');
+  }
+
+  lines.push(`BUTTONS / CTAs — use these exact texts on buttons:`);
+  content.ctas.forEach(c => lines.push(`  - ${c}`));
+  lines.push('');
+
+  lines.push(`PAGE SECTIONS — include all ${content.sections.length} sections in this order:`);
+  content.sections.forEach((s, i) => {
+    lines.push(`  Section ${i+1}:`);
+    if (s.headings.length > 0) lines.push(`    heading: ${s.headings.join(' / ')}`);
+    if (s.texts.length > 0) lines.push(`    body text: ${s.texts.join(' | ')}`);
+    if (s.items.length > 0) lines.push(`    list items (${s.items.length}): ${s.items.join(', ')}`);
+    if (s.tags.length > 0) lines.push(`    tags (${s.tags.length}): ${s.tags.join(', ')}`);
+    if (s.buttons.length > 0) lines.push(`    buttons: ${s.buttons.join(', ')}`);
+  });
+  lines.push('');
+
+  if (content.footer.texts.length > 0 || content.footer.links.length > 0) {
+    lines.push(`FOOTER:`);
+    if (content.footer.headings.length > 0) lines.push(`  headings: ${content.footer.headings.join(', ')}`);
+    if (content.footer.texts.length > 0) lines.push(`  text: ${content.footer.texts.join(' | ')}`);
+    if (content.footer.links.length > 0) lines.push(`  links: ${content.footer.links.join(', ')}`);
+    lines.push('');
+  }
+
+  lines.push(`=== END OF CONTENT ===`);
+  lines.push(`REMINDER: Output clean HTML only. No [brackets], no (labels), no reference numbers in the page.`);
+
+  return lines.join('\n');
+}
+
+// ── Generate HTML (framework=html) ────────────────────────────────────────
+async function generateHTML(content, style, url, customPrompt, framework) {
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+  const contentRef = buildContentReference(content, url);
 
   const styleGuides = {
-    minimal: {
-      name: 'Minimal & Clean',
-      description: 'Pure white background, generous whitespace, sharp typography, no gradients',
-      colors: 'White (#FFFFFF) background, near-black (#111111) text, single accent color',
-      fonts: 'Use system font stack or suggest Google Fonts link for clean sans-serif',
-      mood: 'Apple-like, editorial, breathing space, content-first',
-      animations: 'Subtle fade-in on scroll, clean hover underlines on links',
-    },
-    bold: {
-      name: 'Bold & Dark',
-      description: 'Dark background, vibrant accent colors, strong typography, high contrast',
-      colors: 'Very dark (#0A0A0F) background, white text, vivid accent (electric blue or neon green)',
-      fonts: 'Strong display font for headings, clean body font',
-      mood: 'Powerful, modern tech, confident, premium',
-      animations: 'Gradient text animations, glow effects on hover, slide-in elements',
-    },
-    colorful: {
-      name: 'Colorful & Vibrant',
-      description: 'Rich gradients, playful colors, energetic layout, rounded corners',
-      colors: 'Gradient backgrounds, multiple accent colors, warm and inviting palette',
-      fonts: 'Rounded or friendly display font, readable body font',
-      mood: 'Creative, energetic, modern startup, friendly',
-      animations: 'Colorful gradient shifts, bouncy hover effects, vibrant section transitions',
-    }
+    minimal: { name: 'Minimal & Clean', guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
+    bold:    { name: 'Bold & Dark',     guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
+    colorful:{ name: 'Colorful & Vibrant', guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
+    custom:  { name: 'Custom Design',   guide: customPrompt || 'Modern clean design.' },
   };
 
-  const guide = styleGuides[style];
+  const sg = styleGuides[style] || styleGuides.minimal;
 
-  const contentSummary = `
-Website: ${url}
-Title: ${content.title}
-Description: ${content.description}
-Nav links: ${content.navLinks.map(n => n.text).join(', ')}
-Main headings: ${content.h1s.join(' | ')}
-Sub headings: ${content.h2s.slice(0, 5).join(' | ')}
-Key paragraphs: ${content.paras.slice(0, 4).join(' || ')}
-CTAs/Buttons: ${content.ctas.join(', ')}
-Sections: ${content.sections.map(s => `[${s.heading}: ${s.text.slice(0, 80)}]`).join(' | ')}
-Lists: ${content.lists.map(l => l.join(', ')).join(' | ')}
-  `.trim();
+  const frameworkInstructions = {
+    html: {
+      ext: 'html',
+      label: 'HTML/CSS/JS',
+      instruction: `Return a single complete HTML file with all CSS in a <style> tag and all JS in a <script> tag. No external CSS frameworks. Include Google Fonts <link> in <head>. Start with <!DOCTYPE html>.`,
+    },
+    react: {
+      ext: 'jsx',
+      label: 'React (JSX)',
+      instruction: `Return a single React component file. Use inline styles or a <style> tag via a useEffect. Import React at top. Export default App component. Use useState/useEffect where needed. No external CSS imports. Include Google Fonts via a <link> injected in useEffect. All content in one file.`,
+    },
+    nextjs: {
+      ext: 'jsx',
+      label: 'Next.js',
+      instruction: `Return a Next.js page component. Use 'use client' at top. Import Head from next/head for Google Fonts. Export default function Page(). Use React hooks where needed. All styles in a <style jsx> tag or inline styles. Single file with all content.`,
+    },
+    angular: {
+      ext: 'ts',
+      label: 'Angular',
+      instruction: `Return a single Angular standalone component file. Use @Component decorator with template and styles inline. Import CommonModule. Export the component as default. Use standalone: true. All content in the template string. Include Google Fonts in the styles array.`,
+    },
+    vue: {
+      ext: 'vue',
+      label: 'Vue.js',
+      instruction: `Return a single Vue 3 SFC (.vue file). Use <template>, <script setup>, and <style scoped> sections. Use Composition API. Include Google Fonts in a <link> injected via onMounted. All content in one file.`,
+    },
+  };
 
-  const prompt = `You are a world-class frontend developer and UI designer.
+  const fw = frameworkInstructions[framework] || frameworkInstructions.html;
 
-Create a COMPLETE, BEAUTIFUL, FULLY FUNCTIONAL single-page HTML redesign of this website.
+  const contentRules = `
+ABSOLUTE CONTENT RULES:
+1. INCLUDE EVERY SINGLE ITEM from the content reference below
+2. Copy ALL text VERBATIM — do not change a single word
+3. Include ALL ${content.allListItems.length} list items — not just some of them
+4. Include ALL ${content.badges.length} badges/tags/tech stack items — every single one
+5. Include ALL ${content.sections.length} sections — do not skip any section
+6. Include ALL ${content.paras.length} paragraphs
+7. Do NOT add Lorem ipsum or any invented text
+8. Do NOT remove ANY content
+9. Only change: colors, fonts, layout, spacing, animations — NEVER the text content
 
-STYLE: ${guide.name}
-DESCRIPTION: ${guide.description}
-COLORS: ${guide.colors}
-FONTS: ${guide.fonts}
-MOOD: ${guide.mood}
-ANIMATIONS: ${guide.animations}
+${contentRef}
 
-WEBSITE CONTENT TO USE:
-${contentSummary}
+TECHNICAL REQUIREMENTS:
+- Fully responsive with mobile breakpoints
+- Sticky navigation, smooth scroll
+- CSS animations: fade-in on load, scroll-reveal, hover effects
+- All sections present with ALL their content
+- For images: use CSS gradient placeholders — no broken img tags`;
 
-REQUIREMENTS:
-1. Use ALL the real content from above — real headings, real paragraphs, real nav links, real CTAs
-2. Create a COMPLETE page with: navigation, hero section, features/services sections, and footer
-3. Include <style> with beautiful CSS — NO external CSS frameworks
-4. Include smooth CSS animations and hover effects appropriate for the style
-5. Use Google Fonts (include the <link> tag) for beautiful typography
-6. Make it fully responsive (mobile-friendly)
-7. The design must look PROFESSIONAL and PRODUCTION-READY
-8. Include subtle micro-interactions on buttons and links
-9. Navigation should be sticky/fixed at top
-10. Hero section should be visually impressive and above-fold
+  const styleBlock = `STYLE: ${sg.name}
+STYLE GUIDE: ${sg.guide}
+${style === 'custom' ? `USER CUSTOM INSTRUCTIONS: ${customPrompt}` : ''}`;
 
-CRITICAL: Return ONLY the complete HTML document starting with <!DOCTYPE html>. Nothing else. No markdown, no explanation, no backticks.`;
+  const cleanCode = text => {
+    let t = text.trim();
+    t = t.replace(/^```[\w]*\n?/gm, '').replace(/\n?```/gm, '').trim();
+    return t;
+  };
 
-  const result = await model.generateContent(prompt);
-  let html = result.response.text();
+  const isValidHtml = text => text.includes('<!DOCTYPE') || text.includes('<html');
 
-  html = html.replace(/^```html\n?/i, '').replace(/^```\n?/, '').replace(/\n?```$/, '').trim();
+  // ── Generate plain HTML (used for both preview AND download) ─────────────
+  const htmlPrompt = `You are a frontend developer. Generate a complete HTML website redesign.
 
-  if (!html.startsWith('<!DOCTYPE') && !html.startsWith('<html')) {
-    const docStart = html.indexOf('<!DOCTYPE');
-    if (docStart > -1) html = html.slice(docStart);
+CRITICAL OUTPUT FORMAT:
+- Start with exactly: <!DOCTYPE html>
+- Plain HTML/CSS/JS only — NO React, NO JSX, NO Vue, NO Angular
+- NO import or export statements
+- All CSS in a <style> tag in <head>
+- All JS in a <script> tag before </body>
+- Include Google Fonts via <link> in <head>
+
+CRITICAL CONTENT RULES:
+- Use the EXACT text values from the content reference below
+- Do NOT include any labels, brackets, numbers or markers in your HTML output
+- Do NOT write things like "[H1-1]", "(paragraph)", "[BTN7]", "[TAG1]" — these are instructions for you, not content
+- Output only the clean text: e.g. write "Nandini Raj" not "[H1-1] Nandini Raj"
+- Do NOT output any reference markers whatsoever in the final HTML
+
+${styleBlock}
+
+${contentRules}
+
+FINAL REMINDER: The HTML page must show clean readable text with NO labels, NO brackets, NO reference numbers.
+Start your response with: <!DOCTYPE html>`;
+
+  console.log('[Redesigner] Generating HTML preview for style:', style);
+  let htmlResult = await model.generateContent(htmlPrompt);
+  let previewHtml = cleanCode(htmlResult.response.text());
+
+  // Extract from DOCTYPE if there's prefix text
+  const doctypeIdx = previewHtml.indexOf('<!DOCTYPE');
+  const htmlTagIdx = previewHtml.indexOf('<html');
+  const startIdx = doctypeIdx > -1 ? doctypeIdx : (htmlTagIdx > -1 ? htmlTagIdx : -1);
+  if (startIdx > 0) previewHtml = previewHtml.slice(startIdx);
+
+  // If still not valid HTML, retry once
+  if (!isValidHtml(previewHtml)) {
+    console.warn('[Redesigner] Invalid HTML, retrying...');
+    htmlResult = await model.generateContent(htmlPrompt);
+    previewHtml = cleanCode(htmlResult.response.text());
+    const idx2 = previewHtml.indexOf('<!DOCTYPE');
+    if (idx2 > -1) previewHtml = previewHtml.slice(idx2);
   }
 
-  return { style, styleName: guide.name, html };
+  // Absolute fallback
+  if (!isValidHtml(previewHtml)) {
+    previewHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Preview</title><style>body{margin:0;font-family:sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:1rem;}</style></head><body><h2 style="color:#6366f1">Preview loading failed</h2><p style="opacity:0.5">Please try again</p></body></html>`;
+  }
+
+  console.log('[Redesigner] HTML preview ready, length:', previewHtml.length);
+
+  // ── Framework code = HTML with a comment header explaining usage ──────────
+  // We skip live conversion to avoid timeouts. User downloads HTML and can
+  // copy-paste into their framework or use an online converter.
+  const frameworkNotes = {
+    html:    '',
+    react:   `/* To use in React:\n   1. Create a new .jsx file\n   2. Paste the HTML structure into JSX (convert class → className, style strings → objects)\n   3. Or use dangerouslySetInnerHTML to embed this HTML directly\n   4. Recommended: use https://transform.tools/html-to-jsx to convert automatically\n*/\n\n`,
+    nextjs:  `/* To use in Next.js:\n   1. Create app/page.jsx or pages/index.jsx\n   2. Paste the HTML into a component with dangerouslySetInnerHTML\n   3. Or convert to JSX using https://transform.tools/html-to-jsx\n   4. Move <style> contents to a .module.css file\n*/\n\n`,
+    vue:     `<!-- To use in Vue.js:\n  1. Create a .vue file\n  2. Paste HTML into <template>, CSS into <style scoped>\n  3. Or use this HTML directly via v-html directive\n  4. Recommended: https://transform.tools/ for conversion\n-->\n\n`,
+    angular: `/* To use in Angular:\n   1. Paste HTML into component template\n   2. Move CSS into component styles array\n   3. Replace class attributes (no changes needed for Angular)\n   4. Or use [innerHTML] binding to embed directly\n*/\n\n`,
+  };
+
+  const note = frameworkNotes[framework] || '';
+  const frameworkCode = note + previewHtml;
+
+  return {
+    style,
+    styleName: sg.name,
+    framework,
+    frameworkLabel: fw.label,
+    ext: framework === 'html' ? 'html' : 'html', // always html for now
+    code: frameworkCode,
+    previewHtml,
+  };
 }
 
+// ── Main controller ───────────────────────────────────────────────────────
 const redesignWebsite = async (req, res) => {
-  const { websiteUrl } = req.body;
+  const { websiteUrl, customPrompt, framework = 'html' } = req.body;
 
   if (!websiteUrl || !websiteUrl.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'Valid website URL is required.' });
   }
 
   try {
-    console.log('[Redesigner] Scraping content from:', websiteUrl);
-    const content = await scrapePageContent(websiteUrl);
-    console.log('[Redesigner] Scraped:', content.title, '| Sections:', content.sections.length);
-
-    console.log('[Redesigner] Generating 3 redesign styles...');
-    const [minimalResult, boldResult, colorfulResult] = await Promise.all([
-      generateStyledHTML(content, 'minimal', websiteUrl),
-      generateStyledHTML(content, 'bold', websiteUrl),
-      generateStyledHTML(content, 'colorful', websiteUrl),
+    console.log('[Redesigner] Scraping:', websiteUrl);
+    const [screenshotBase64, content] = await Promise.all([
+      screenshotWebsite(websiteUrl),
+      scrapePageContent(websiteUrl),
     ]);
 
-    console.log('[Redesigner] All 3 designs generated successfully');
+    console.log(`[Redesigner] Scraped — H1:${content.h1s.length} H2:${content.h2s.length} P:${content.paras.length} LI:${content.allListItems.length} Tags:${content.badges.length} Sections:${content.sections.length}`);
+
+    const stylesList = ['minimal', 'bold', 'colorful'];
+    if (customPrompt && customPrompt.trim().length > 5) {
+      stylesList.push('custom');
+    }
+
+    console.log(`[Redesigner] Generating ${stylesList.length} designs sequentially in ${framework}...`);
+
+    // Run sequentially to avoid rate limits and timeouts
+    const designs = [];
+    for (const style of stylesList) {
+      console.log(`[Redesigner] Generating style: ${style}`);
+      const design = await generateHTML(
+        content, style, websiteUrl,
+        style === 'custom' ? customPrompt.trim() : null,
+        framework
+      );
+      designs.push(design);
+      console.log(`[Redesigner] Done: ${style}`);
+    }
+
+    console.log('[Redesigner] All designs complete.');
 
     return res.status(200).json({
-      success: true,
-      websiteUrl,
+      success: true, websiteUrl,
       pageTitle: content.title,
-      screenshotBase64: content.screenshotBase64,
-      designs: [minimalResult, boldResult, colorfulResult],
+      screenshotBase64,
+      designs,
+      stats: {
+        headings: content.h1s.length + content.h2s.length + content.h3s.length,
+        paragraphs: content.paras.length,
+        listItems: content.allListItems.length,
+        tags: content.badges.length,
+        sections: content.sections.length,
+      },
     });
 
   } catch (error) {
     console.error('[Redesigner] Error:', error.message);
-    return res.status(500).json({ success: false, message: error.message || 'Failed to redesign website.' });
+    return res.status(500).json({ success: false, message: error.message });
   }
 };
 
