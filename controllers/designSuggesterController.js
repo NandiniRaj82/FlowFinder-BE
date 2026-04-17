@@ -346,7 +346,7 @@ Start your response with: <!DOCTYPE html>`;
   // ── Framework code = HTML with a comment header explaining usage ──────────
   // We skip live conversion to avoid timeouts. User downloads HTML and can
   // copy-paste into their framework or use an online converter.
-  const frameworkNotes= {
+  const frameworkNotes = {
     html:    '',
     react:   `/* To use in React:\n   1. Create a new .jsx file\n   2. Paste the HTML structure into JSX (convert class → className, style strings → objects)\n   3. Or use dangerouslySetInnerHTML to embed this HTML directly\n   4. Recommended: use https://transform.tools/html-to-jsx to convert automatically\n*/\n\n`,
     nextjs:  `/* To use in Next.js:\n   1. Create app/page.jsx or pages/index.jsx\n   2. Paste the HTML into a component with dangerouslySetInnerHTML\n   3. Or convert to JSX using https://transform.tools/html-to-jsx\n   4. Move <style> contents to a .module.css file\n*/\n\n`,
