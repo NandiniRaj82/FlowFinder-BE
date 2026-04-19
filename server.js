@@ -28,13 +28,13 @@ app.use(cors({
 }));
 
 // Body Parser Middleware with 200MB limits
-app.use(express.json({ 
+app.use(express.json({
     limit: '200mb',
-    parameterLimit: 50000 
+    parameterLimit: 50000
 }));
 
-app.use(express.urlencoded({ 
-    extended: true, 
+app.use(express.urlencoded({
+    extended: true,
     limit: '200mb',
     parameterLimit: 50000
 }));
@@ -51,13 +51,15 @@ app.use((req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/accessibility', accessibilityRoutes);
 app.use('/api/match-design', (req, res, next) => {
-  res.setTimeout(120000); // 2 minutes
-  next();
+    // 3 minutes — enough for Puppeteer + Figma API + Gemini in parallel
+    req.socket.setTimeout(180000);
+    res.setTimeout(180000);
+    next();
 }, require('./router/matchDesignRoute'));
 app.use('/api/redesign', require('./router/designSuggesterRoute'));
 app.get('/api/health', (req, res) => {
-    res.status(200).json({ 
-        success: true, 
+    res.status(200).json({
+        success: true,
         message: 'Server is running',
         aiProvider: 'Google Gemini',
         geminiApiConfigured: !!process.env.GEMINI_API_KEY,
@@ -76,11 +78,11 @@ app.use((req, res) => {
 // Error handler - Enhanced
 app.use((err, req, res, next) => {
     console.error('Error occurred:', err);
-    
+
     // Handle Multer errors
     if (err.name === 'MulterError') {
         console.error('Multer Error Code:', err.code);
-        
+
         if (err.code === 'LIMIT_FILE_SIZE') {
             return res.status(400).json({
                 success: false,
@@ -89,7 +91,7 @@ app.use((err, req, res, next) => {
                 maxSize: '200MB'
             });
         }
-        
+
         if (err.code === 'LIMIT_FILE_COUNT') {
             return res.status(400).json({
                 success: false,
@@ -97,7 +99,7 @@ app.use((err, req, res, next) => {
                 error: 'LIMIT_FILE_COUNT'
             });
         }
-        
+
         return res.status(400).json({
             success: false,
             message: 'File upload error',
@@ -105,7 +107,7 @@ app.use((err, req, res, next) => {
             code: err.code
         });
     }
-    
+
     // Handle invalid file type
     if (err.message === 'Invalid file type') {
         return res.status(400).json({
@@ -114,7 +116,7 @@ app.use((err, req, res, next) => {
             error: 'INVALID_FILE_TYPE'
         });
     }
-    
+
     // Handle payload too large
     if (err.type === 'entity.too.large') {
         return res.status(413).json({
@@ -123,7 +125,7 @@ app.use((err, req, res, next) => {
             error: 'PAYLOAD_TOO_LARGE'
         });
     }
-    
+
     // Generic error
     res.status(err.status || 500).json({
         success: false,
@@ -143,10 +145,10 @@ const server = app.listen(port, () => {
 // Set timeout to 5 minutes (300000ms) for large file uploads
 server.setTimeout(300000);
 
-// Handle server timeout
+// Handle server timeout — log only, do NOT close socket (would kill in-flight responses)
 server.on('timeout', (socket) => {
-    console.error('Server timeout - possibly due to large file upload');
-    socket.end('HTTP/1.1 408 Request Timeout\r\n\r\n');
+    console.warn('[Server] Socket timeout — keeping connection alive for active requests');
+    // Do NOT call socket.end() — this would terminate in-flight API responses
 });
 
 module.exports = app;
