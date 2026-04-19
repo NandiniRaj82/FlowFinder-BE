@@ -221,10 +221,14 @@ async function generateHTML(content, style, url, customPrompt, framework) {
   const contentRef = buildContentReference(content, url);
 
   const styleGuides = {
-    minimal: { name: 'Minimal & Clean', guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
-    bold:    { name: 'Bold & Dark',     guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
-    colorful:{ name: 'Colorful & Vibrant', guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
-    custom:  { name: 'Custom Design',   guide: customPrompt || 'Modern clean design.' },
+    minimal:  { name: 'Minimal & Clean',     guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
+    bold:     { name: 'Bold & Dark',         guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
+    colorful: { name: 'Colorful & Vibrant',  guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
+    custom_1: { name: 'Custom Design 1',     guide: customPrompt || 'Modern clean design.' },
+    custom_2: { name: 'Custom Design 2',     guide: customPrompt || 'Modern clean design.' },
+    custom_3: { name: 'Custom Design 3',     guide: customPrompt || 'Modern clean design.' },
+    // legacy key kept for backwards compat
+    custom:   { name: 'Custom Design',       guide: customPrompt || 'Modern clean design.' },
   };
 
   const sg = styleGuides[style] || styleGuides.minimal;
@@ -280,9 +284,10 @@ TECHNICAL REQUIREMENTS:
 - All sections present with ALL their content
 - For images: use CSS gradient placeholders — no broken img tags`;
 
+  const isCustomStyle = style.startsWith('custom');
   const styleBlock = `STYLE: ${sg.name}
 STYLE GUIDE: ${sg.guide}
-${style === 'custom' ? `USER CUSTOM INSTRUCTIONS: ${customPrompt}` : ''}`;
+${isCustomStyle ? `USER CUSTOM INSTRUCTIONS: ${customPrompt}` : ''}`;
 
   const cleanCode = text => {
     let t = text.trim();
@@ -368,16 +373,220 @@ Start your response with: <!DOCTYPE html>`;
   };
 }
 
-// ── Main controller ───────────────────────────────────────────────────────
+// ── Fallback HTML generator (no Gemini) ──────────────────────────────────
+function generateFallbackHTML(content, style, url) {
+  const styleConfigs = {
+    minimal: {
+      name: 'Minimal & Clean',
+      font: 'DM Sans',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;700&display=swap',
+      bg: '#ffffff', text: '#111111', accent: '#2563EB', navBg: '#ffffff',
+      navBorder: '#e5e7eb', cardBg: '#f9fafb', badgeBg: '#dbeafe', badgeText: '#1d4ed8',
+      btnBg: '#2563EB', btnText: '#ffffff', sectionBg: '#f9fafb', footerBg: '#111111', footerText: '#ffffff',
+    },
+    bold: {
+      name: 'Bold & Dark',
+      font: 'Syne',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=Syne:wght@400;700;800&display=swap',
+      bg: '#0a0a0f', text: '#ffffff', accent: '#3b82f6', navBg: '#0a0a0f',
+      navBorder: '#1e1e2e', cardBg: '#13131f', badgeBg: '#1e3a8a', badgeText: '#93c5fd',
+      btnBg: '#3b82f6', btnText: '#ffffff', sectionBg: '#0d0d18', footerBg: '#050508', footerText: '#9ca3af',
+    },
+    colorful: {
+      name: 'Colorful & Vibrant',
+      font: 'Poppins',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=Poppins:wght@400;600;700&display=swap',
+      bg: '#fdf4ff', text: '#1e1b4b', accent: '#7c3aed', navBg: '#ffffff',
+      navBorder: '#e9d5ff', cardBg: '#ffffff', badgeBg: '#ede9fe', badgeText: '#6d28d9',
+      btnBg: '#7c3aed', btnText: '#ffffff', sectionBg: '#faf5ff', footerBg: '#1e1b4b', footerText: '#e0e7ff',
+    },
+    custom: {
+      name: 'Custom Design',
+      font: 'Playfair Display',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&display=swap',
+      bg: '#0f172a', text: '#f8fafc', accent: '#f59e0b', navBg: '#0f172a',
+      navBorder: '#1e293b', cardBg: '#1e293b', badgeBg: '#451a03', badgeText: '#fcd34d',
+      btnBg: '#f59e0b', btnText: '#0f172a', sectionBg: '#1e293b', footerBg: '#020617', footerText: '#94a3b8',
+    },
+    custom_1: {
+      name: 'Custom Design 1',
+      font: 'Playfair Display',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700&display=swap',
+      bg: '#0f172a', text: '#f8fafc', accent: '#f59e0b', navBg: '#0f172a',
+      navBorder: '#1e293b', cardBg: '#1e293b', badgeBg: '#451a03', badgeText: '#fcd34d',
+      btnBg: '#f59e0b', btnText: '#0f172a', sectionBg: '#1e293b', footerBg: '#020617', footerText: '#94a3b8',
+    },
+    custom_2: {
+      name: 'Custom Design 2',
+      font: 'Inter',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap',
+      bg: '#f0fdf4', text: '#14532d', accent: '#16a34a', navBg: '#ffffff',
+      navBorder: '#bbf7d0', cardBg: '#dcfce7', badgeBg: '#bbf7d0', badgeText: '#166534',
+      btnBg: '#16a34a', btnText: '#ffffff', sectionBg: '#f0fdf4', footerBg: '#14532d', footerText: '#bbf7d0',
+    },
+    custom_3: {
+      name: 'Custom Design 3',
+      font: 'Space Grotesk',
+      fontUrl: 'https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap',
+      bg: '#fafaf9', text: '#1c1917', accent: '#dc2626', navBg: '#fafaf9',
+      navBorder: '#e7e5e4', cardBg: '#f5f5f4', badgeBg: '#fee2e2', badgeText: '#991b1b',
+      btnBg: '#dc2626', btnText: '#ffffff', sectionBg: '#f5f5f4', footerBg: '#1c1917', footerText: '#a8a29e',
+    },
+  };
+
+  const s = styleConfigs[style] || styleConfigs.minimal;
+  const title = content.title || new URL(url).hostname;
+  const logoText = content.logoText || title;
+  const navLinks = content.navLinks.slice(0, 8);
+  const h1 = content.h1s[0] || title;
+  const heroPara = content.paras[0] || '';
+
+  const navLinksHtml = navLinks.map(n =>
+    `<a href="${n.href || '#'}" style="color:${s.text};text-decoration:none;font-weight:500;opacity:0.85;transition:opacity 0.2s" onmouseover="this.style.opacity=1" onmouseout="this.style.opacity=0.85">${n.text}</a>`
+  ).join('');
+
+  const badgesHtml = content.badges.slice(0, 40).map(b =>
+    `<span style="background:${s.badgeBg};color:${s.badgeText};padding:6px 14px;border-radius:999px;font-size:13px;font-weight:600;display:inline-block;margin:4px">${b}</span>`
+  ).join('');
+
+  const ctasHtml = content.ctas.slice(0, 4).map((c, i) =>
+    `<a href="#" style="display:inline-block;padding:12px 28px;border-radius:8px;font-weight:700;font-size:15px;text-decoration:none;margin:6px;background:${i === 0 ? s.btnBg : 'transparent'};color:${i === 0 ? s.btnText : s.accent};border:2px solid ${s.accent};transition:opacity 0.2s" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1">${c}</a>`
+  ).join('');
+
+  const sectionsHtml = content.sections.slice(0, 10).map((sec, idx) => {
+    const heading = sec.headings[0] || '';
+    const texts = sec.texts.map(t => `<p style="color:${s.text};opacity:0.8;line-height:1.8;margin-bottom:12px">${t}</p>`).join('');
+    const items = sec.items.length > 0
+      ? `<ul style="padding-left:20px;margin-top:12px">${sec.items.map(li => `<li style="color:${s.text};opacity:0.8;margin-bottom:8px;line-height:1.6">${li}</li>`).join('')}</ul>`
+      : '';
+    const tags = sec.tags.length > 0
+      ? `<div style="margin-top:12px">${sec.tags.map(t => `<span style="background:${s.badgeBg};color:${s.badgeText};padding:4px 12px;border-radius:999px;font-size:12px;font-weight:600;display:inline-block;margin:3px">${t}</span>`).join('')}</div>`
+      : '';
+    if (!heading && !texts && !items) return '';
+    return `
+    <section style="padding:60px 0;background:${idx % 2 === 0 ? s.bg : s.sectionBg};animation:fadeIn 0.6s ease-out ${idx * 0.1}s both">
+      <div style="max-width:900px;margin:0 auto;padding:0 24px">
+        ${heading ? `<h2 style="font-size:clamp(24px,4vw,38px);font-weight:700;color:${s.accent};margin-bottom:20px">${heading}</h2>` : ''}
+        ${texts}${items}${tags}
+      </div>
+    </section>`;
+  }).join('');
+
+  const footerLinksHtml = content.footer.links.slice(0, 6).map(l =>
+    `<a href="#" style="color:${s.footerText};opacity:0.7;text-decoration:none;margin:0 12px;font-size:14px">${l}</a>`
+  ).join('');
+
+  const allListItemsHtml = content.allListItems.length > 0
+    ? `<section style="padding:60px 0;background:${s.sectionBg}">
+        <div style="max-width:900px;margin:0 auto;padding:0 24px">
+          <ul style="columns:2;padding-left:20px">${content.allListItems.slice(0, 30).map(li =>
+            `<li style="color:${s.text};opacity:0.8;margin-bottom:8px;line-height:1.6;break-inside:avoid">${li}</li>`
+          ).join('')}</ul>
+        </div>
+       </section>`
+    : '';
+
+  const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${title}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="${s.fontUrl}" rel="stylesheet">
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{font-family:'${s.font}',sans-serif;background:${s.bg};color:${s.text};line-height:1.6}
+  @keyframes fadeIn{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+  nav a:hover{opacity:1!important}
+  @media(max-width:768px){.nav-links{display:none}.hero-title{font-size:32px!important}}
+</style>
+</head>
+<body>
+<!-- NAV -->
+<nav style="position:sticky;top:0;z-index:100;background:${s.navBg};border-bottom:1px solid ${s.navBorder};padding:16px 24px;display:flex;align-items:center;justify-content:space-between;backdrop-filter:blur(10px)">
+  <span style="font-weight:800;font-size:20px;color:${s.accent}">${logoText}</span>
+  <div class="nav-links" style="display:flex;gap:28px">${navLinksHtml}</div>
+</nav>
+
+<!-- HERO -->
+<section style="padding:100px 24px 80px;text-align:center;animation:fadeIn 0.7s ease-out both">
+  <div style="max-width:800px;margin:0 auto">
+    <h1 class="hero-title" style="font-size:clamp(36px,6vw,64px);font-weight:800;line-height:1.15;margin-bottom:24px;color:${s.text}">${h1}</h1>
+    ${heroPara ? `<p style="font-size:18px;opacity:0.75;max-width:600px;margin:0 auto 36px;line-height:1.8">${heroPara}</p>` : ''}
+    <div>${ctasHtml}</div>
+  </div>
+</section>
+
+${sectionsHtml}
+
+${badgesHtml ? `<section style="padding:60px 0;background:${s.sectionBg}">
+  <div style="max-width:900px;margin:0 auto;padding:0 24px;text-align:center">
+    <h2 style="font-size:28px;font-weight:700;color:${s.accent};margin-bottom:24px">Skills & Technologies</h2>
+    <div>${badgesHtml}</div>
+  </div>
+</section>` : ''}
+
+${allListItemsHtml}
+
+<!-- FOOTER -->
+<footer style="background:${s.footerBg};color:${s.footerText};padding:40px 24px;text-align:center">
+  ${content.footer.texts.length > 0 ? `<p style="opacity:0.7;margin-bottom:12px">${content.footer.texts[0]}</p>` : ''}
+  <div>${footerLinksHtml}</div>
+  <p style="margin-top:20px;opacity:0.4;font-size:13px">© ${new Date().getFullYear()} ${logoText}</p>
+</footer>
+
+<script>
+  document.querySelectorAll('a[href^="#"]').forEach(a=>{
+    a.addEventListener('click',e=>{
+      const t=document.querySelector(a.getAttribute('href'));
+      if(t){e.preventDefault();t.scrollIntoView({behavior:'smooth'})}
+    });
+  });
+</script>
+</body>
+</html>`;
+
+  return {
+    style,
+    styleName: s.name + ' (Fallback)',
+    framework: 'html',
+    frameworkLabel: 'HTML',
+    ext: 'html',
+    code: html,
+    previewHtml: html,
+  };
+}
+
+// ── Main controller (SSE streaming) ───────────────────────────────────────
 const redesignWebsite = async (req, res) => {
-  const { websiteUrl, customPrompt, framework = 'html' } = req.body;
+  const {
+    websiteUrl,
+    selectedStyles = ['minimal', 'bold', 'colorful'],
+    customPrompts  = [],
+    framework      = 'html',
+  } = req.body;
 
   if (!websiteUrl || !websiteUrl.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'Valid website URL is required.' });
   }
 
+  // SSE headers
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+  };
+
   try {
+    send('status', { message: 'Scraping website content…' });
     console.log('[Redesigner] Scraping:', websiteUrl);
+
     const [screenshotBase64, content] = await Promise.all([
       screenshotWebsite(websiteUrl),
       scrapePageContent(websiteUrl),
@@ -385,45 +594,60 @@ const redesignWebsite = async (req, res) => {
 
     console.log(`[Redesigner] Scraped — H1:${content.h1s.length} H2:${content.h2s.length} P:${content.paras.length} LI:${content.allListItems.length} Tags:${content.badges.length} Sections:${content.sections.length}`);
 
-    const stylesList = ['minimal', 'bold', 'colorful'];
-    if (customPrompt && customPrompt.trim().length > 5) {
-      stylesList.push('custom');
+    const stats = {
+      headings: content.h1s.length + content.h2s.length + content.h3s.length,
+      paragraphs: content.paras.length,
+      listItems: content.allListItems.length,
+      tags: content.badges.length,
+      sections: content.sections.length,
+    };
+
+    // Send meta immediately so frontend can show header
+    send('meta', { pageTitle: content.title, screenshotBase64, stats, websiteUrl });
+
+    // Build a list of { styleKey, customPrompt } entries to process
+    const stylesList = [
+      ...selectedStyles.map(s => ({ styleKey: s, prompt: null })),
+      ...customPrompts
+        .map((p, i) => ({ styleKey: `custom_${i + 1}`, prompt: p }))
+        .filter(e => e.prompt && e.prompt.trim().length > 5),
+    ];
+
+    const styleDisplayNames = {
+      minimal:  'Minimal & Clean',
+      bold:     'Bold & Dark',
+      colorful: 'Colorful & Vibrant',
+      custom_1: 'Custom Design 1',
+      custom_2: 'Custom Design 2',
+      custom_3: 'Custom Design 3',
+    };
+
+    for (const { styleKey, prompt } of stylesList) {
+      const displayName = styleDisplayNames[styleKey] || styleKey;
+      send('status', { message: `Generating ${displayName} design…` });
+      console.log(`[Redesigner] Generating style: ${styleKey}`);
+
+      let design;
+      try {
+        design = await generateHTML(content, styleKey, websiteUrl, prompt, framework);
+      } catch (geminiErr) {
+        console.warn(`[Redesigner] Gemini failed for ${styleKey}, using fallback:`, geminiErr.message);
+        send('status', { message: `Gemini unavailable for ${displayName} — using template fallback…` });
+        design = generateFallbackHTML(content, styleKey, websiteUrl);
+      }
+
+      console.log(`[Redesigner] Done: ${styleKey}`);
+      send('design', { design });
     }
 
-    console.log(`[Redesigner] Generating ${stylesList.length} designs sequentially in ${framework}...`);
-
-    // Run sequentially to avoid rate limits and timeouts
-    const designs = [];
-    for (const style of stylesList) {
-      console.log(`[Redesigner] Generating style: ${style}`);
-      const design = await generateHTML(
-        content, style, websiteUrl,
-        style === 'custom' ? customPrompt.trim() : null,
-        framework
-      );
-      designs.push(design);
-      console.log(`[Redesigner] Done: ${style}`);
-    }
-
+    send('done', { success: true });
     console.log('[Redesigner] All designs complete.');
-
-    return res.status(200).json({
-      success: true, websiteUrl,
-      pageTitle: content.title,
-      screenshotBase64,
-      designs,
-      stats: {
-        headings: content.h1s.length + content.h2s.length + content.h3s.length,
-        paragraphs: content.paras.length,
-        listItems: content.allListItems.length,
-        tags: content.badges.length,
-        sections: content.sections.length,
-      },
-    });
+    res.end();
 
   } catch (error) {
-    console.error('[Redesigner] Error:', error.message);
-    return res.status(500).json({ success: false, message: error.message });
+    console.error('[Redesigner] Fatal error:', error.message);
+    send('error', { message: error.message });
+    res.end();
   }
 };
 
