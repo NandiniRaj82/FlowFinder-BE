@@ -51,9 +51,10 @@ app.use((req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/accessibility', accessibilityRoutes);
 app.use('/api/match-design', (req, res, next) => {
-    // 3 minutes — enough for Puppeteer + Figma API + Gemini in parallel
-    req.socket.setTimeout(180000);
-    res.setTimeout(180000);
+    // F) 5 minutes — Puppeteer (60s) + Figma retries (up to 90s) + Gemini
+    req.setTimeout(300000);
+    req.socket.setTimeout(300000);
+    res.setTimeout(300000);
     next();
 }, require('./router/matchDesignRoute'));
 app.use('/api/redesign', require('./router/designSuggesterRoute'));
