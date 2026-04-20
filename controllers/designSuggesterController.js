@@ -221,13 +221,22 @@ async function generateHTML(content, style, url, customPrompt, framework) {
   const contentRef = buildContentReference(content, url);
 
   const styleGuides = {
-    minimal: { name: 'Minimal & Clean', guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
-    bold:    { name: 'Bold & Dark',     guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
-    colorful:{ name: 'Colorful & Vibrant', guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
-    custom:  { name: 'Custom Design',   guide: customPrompt || 'Modern clean design.' },
+    minimal:  { name: 'Minimal & Clean',   guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
+    bold:     { name: 'Bold & Dark',       guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
+    colorful: { name: 'Colorful & Vibrant', guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
+    custom:   { name: 'Custom Design',     guide: customPrompt || 'Modern clean design.' },
+    custom_1: { name: 'Custom Style 1',    guide: customPrompt || 'Modern clean design.' },
+    custom_2: { name: 'Custom Style 2',    guide: customPrompt || 'Modern clean design.' },
+    custom_3: { name: 'Custom Style 3',    guide: customPrompt || 'Modern clean design.' },
   };
 
   const sg = styleGuides[style] || styleGuides.minimal;
+  // For any custom_N key always inject the actual prompt so it overrides the placeholder
+  if (style.startsWith('custom') && customPrompt) {
+    sg.guide = customPrompt;
+    sg.name  = style === 'custom' ? 'Custom Design'
+             : `Custom Style ${style.replace('custom_', '')}`;
+  }
 
   const frameworkInstructions = {
     html: {
@@ -280,9 +289,10 @@ TECHNICAL REQUIREMENTS:
 - All sections present with ALL their content
 - For images: use CSS gradient placeholders — no broken img tags`;
 
+  const isCustomStyle = style === 'custom' || style.startsWith('custom_');
   const styleBlock = `STYLE: ${sg.name}
 STYLE GUIDE: ${sg.guide}
-${style === 'custom' ? `USER CUSTOM INSTRUCTIONS: ${customPrompt}` : ''}`;
+${isCustomStyle && customPrompt ? `USER CUSTOM INSTRUCTIONS: ${customPrompt}` : ''}`;
 
   const cleanCode = text => {
     let t = text.trim();
@@ -368,62 +378,101 @@ Start your response with: <!DOCTYPE html>`;
   };
 }
 
-// ── Main controller ───────────────────────────────────────────────────────
+// ── SSE helper ────────────────────────────────────────────────────────────
+function sendSSE(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+// ── Main controller (SSE streaming) ──────────────────────────────────────
 const redesignWebsite = async (req, res) => {
-  const { websiteUrl, customPrompt, framework = 'html' } = req.body;
+  const { websiteUrl, selectedStyles, customPrompts = [], framework = 'html' } = req.body;
 
   if (!websiteUrl || !websiteUrl.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'Valid website URL is required.' });
   }
 
+  // ── Set up SSE headers ────────────────────────────────────────────────
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  // Keep connection alive every 20 s
+  const heartbeat = setInterval(() => { res.write(': ping\n\n'); }, 20000);
+  const cleanup = () => clearInterval(heartbeat);
+  req.on('close', cleanup);
+
   try {
+    sendSSE(res, 'status', { message: 'Scraping site & generating redesigns…' });
     console.log('[Redesigner] Scraping:', websiteUrl);
+
     const [screenshotBase64, content] = await Promise.all([
       screenshotWebsite(websiteUrl),
       scrapePageContent(websiteUrl),
     ]);
 
-    console.log(`[Redesigner] Scraped — H1:${content.h1s.length} H2:${content.h2s.length} P:${content.paras.length} LI:${content.allListItems.length} Tags:${content.badges.length} Sections:${content.sections.length}`);
+    console.log(`[Redesigner] Scraped — H1:${content.h1s.length} P:${content.paras.length} Sections:${content.sections.length}`);
 
-    const stylesList = ['minimal', 'bold', 'colorful'];
-    if (customPrompt && customPrompt.trim().length > 5) {
-      stylesList.push('custom');
-    }
 
-    console.log(`[Redesigner] Generating ${stylesList.length} designs sequentially in ${framework}...`);
+    // meta will be emitted below after allStyles is built (includes totalDesigns)
 
-    // Run sequentially to avoid rate limits and timeouts
-    const designs = [];
-    for (const style of stylesList) {
-      console.log(`[Redesigner] Generating style: ${style}`);
-      const design = await generateHTML(
-        content, style, websiteUrl,
-        style === 'custom' ? customPrompt.trim() : null,
-        framework
-      );
-      designs.push(design);
-      console.log(`[Redesigner] Done: ${style}`);
-    }
 
-    console.log('[Redesigner] All designs complete.');
+    // Build list of styles to generate
+    const stylesList = selectedStyles && selectedStyles.length > 0
+      ? selectedStyles
+      : ['minimal', 'bold', 'colorful'];
 
-    return res.status(200).json({
-      success: true, websiteUrl,
+    // Add custom styles for each non-empty custom prompt
+    const customList = customPrompts
+      .map((p, i) => ({ key: `custom_${i + 1}`, prompt: p.trim() }))
+      .filter(c => c.prompt.length > 5);
+
+    const allStyles = [
+      ...stylesList.map(s => ({ key: s, prompt: null })),
+      ...customList,
+    ];
+
+    // Re-emit meta with totalDesigns now that we know the count
+    sendSSE(res, 'meta', {
       pageTitle: content.title,
       screenshotBase64,
-      designs,
+      totalDesigns: allStyles.length,
       stats: {
-        headings: content.h1s.length + content.h2s.length + content.h3s.length,
+        headings:  content.h1s.length + content.h2s.length + content.h3s.length,
         paragraphs: content.paras.length,
-        listItems: content.allListItems.length,
-        tags: content.badges.length,
-        sections: content.sections.length,
+        listItems:  content.allListItems.length,
+        tags:       content.badges.length,
+        sections:   content.sections.length,
       },
     });
 
+
+    console.log(`[Redesigner] Generating ${allStyles.length} designs in ${framework}…`);
+
+    // Generate each design and stream it as soon as it's done
+    for (const { key, prompt } of allStyles) {
+      sendSSE(res, 'status', { message: `Generating ${key} design…` });
+      console.log(`[Redesigner] Generating style: ${key}`);
+
+      const design = await generateHTML(
+        content, key, websiteUrl, prompt, framework
+      );
+      design.style = key; // ensure key is set (generateHTML may use 'custom')
+
+      sendSSE(res, 'design', { design });
+      console.log(`[Redesigner] Streamed: ${key}`);
+    }
+
+    sendSSE(res, 'done', { success: true });
+    console.log('[Redesigner] All designs streamed.');
+
   } catch (error) {
     console.error('[Redesigner] Error:', error.message);
-    return res.status(500).json({ success: false, message: error.message });
+    sendSSE(res, 'error', { message: error.message || 'Redesign failed.' });
+  } finally {
+    cleanup();
+    res.end();
   }
 };
 
