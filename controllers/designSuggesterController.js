@@ -109,10 +109,10 @@ async function scrapePageContent(url) {
       sectionEls.forEach(sec => {
         const id = sec.id || sec.className?.toString()?.split(' ')[0] || '';
         const headings = Array.from(sec.querySelectorAll('h1,h2,h3,h4')).map(h => clean(h.innerText)).filter(Boolean);
-        const texts    = Array.from(sec.querySelectorAll('p')).filter(p => isVisible(p)).map(p => clean(p.innerText)).filter(p => p.length > 10);
-        const items    = Array.from(sec.querySelectorAll('li')).filter(li => isVisible(li)).map(li => clean(li.innerText)).filter(t => t.length > 1);
-        const btns     = Array.from(sec.querySelectorAll('button, a[href]')).filter(b => isVisible(b)).map(b => clean(b.innerText)).filter(b => b.length > 0 && b.length < 60);
-        const tags     = Array.from(sec.querySelectorAll('span, .badge, .tag, .chip')).filter(el => isVisible(el)).map(el => clean(el.innerText)).filter(t => t.length > 1 && t.length < 30);
+        const texts = Array.from(sec.querySelectorAll('p')).filter(p => isVisible(p)).map(p => clean(p.innerText)).filter(p => p.length > 10);
+        const items = Array.from(sec.querySelectorAll('li')).filter(li => isVisible(li)).map(li => clean(li.innerText)).filter(t => t.length > 1);
+        const btns = Array.from(sec.querySelectorAll('button, a[href]')).filter(b => isVisible(b)).map(b => clean(b.innerText)).filter(b => b.length > 0 && b.length < 60);
+        const tags = Array.from(sec.querySelectorAll('span, .badge, .tag, .chip')).filter(el => isVisible(el)).map(el => clean(el.innerText)).filter(t => t.length > 1 && t.length < 30);
 
         if (headings.length > 0 || texts.length > 0 || items.length > 0) {
           sections.push({ id, headings, texts, items, buttons: btns, tags });
@@ -122,8 +122,8 @@ async function scrapePageContent(url) {
       // Footer
       const footerEl = document.querySelector('footer');
       const footerHeadings = footerEl ? Array.from(footerEl.querySelectorAll('h1,h2,h3,h4,h5')).map(h => clean(h.innerText)).filter(Boolean) : [];
-      const footerTexts    = footerEl ? Array.from(footerEl.querySelectorAll('p')).map(p => clean(p.innerText)).filter(Boolean) : [];
-      const footerLinks    = footerEl ? Array.from(footerEl.querySelectorAll('a')).map(a => clean(a.innerText)).filter(Boolean) : [];
+      const footerTexts = footerEl ? Array.from(footerEl.querySelectorAll('p')).map(p => clean(p.innerText)).filter(Boolean) : [];
+      const footerLinks = footerEl ? Array.from(footerEl.querySelectorAll('a')).map(a => clean(a.innerText)).filter(Boolean) : [];
 
       return {
         title, description, logoText,
@@ -192,7 +192,7 @@ function buildContentReference(content, url) {
 
   lines.push(`PAGE SECTIONS — include all ${content.sections.length} sections in this order:`);
   content.sections.forEach((s, i) => {
-    lines.push(`  Section ${i+1}:`);
+    lines.push(`  Section ${i + 1}:`);
     if (s.headings.length > 0) lines.push(`    heading: ${s.headings.join(' / ')}`);
     if (s.texts.length > 0) lines.push(`    body text: ${s.texts.join(' | ')}`);
     if (s.items.length > 0) lines.push(`    list items (${s.items.length}): ${s.items.join(', ')}`);
@@ -221,21 +221,21 @@ async function generateHTML(content, style, url, customPrompt, framework) {
   const contentRef = buildContentReference(content, url);
 
   const styleGuides = {
-    minimal:  { name: 'Minimal & Clean',   guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
-    bold:     { name: 'Bold & Dark',       guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
+    minimal: { name: 'Minimal & Clean', guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
+    bold: { name: 'Bold & Dark', guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
     colorful: { name: 'Colorful & Vibrant', guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
-    custom:   { name: 'Custom Design',     guide: customPrompt || 'Modern clean design.' },
-    custom_1: { name: 'Custom Style 1',    guide: customPrompt || 'Modern clean design.' },
-    custom_2: { name: 'Custom Style 2',    guide: customPrompt || 'Modern clean design.' },
-    custom_3: { name: 'Custom Style 3',    guide: customPrompt || 'Modern clean design.' },
+    custom: { name: 'Custom Design', guide: customPrompt || 'Modern clean design.' },
+    custom_1: { name: 'Custom Style 1', guide: customPrompt || 'Modern clean design.' },
+    custom_2: { name: 'Custom Style 2', guide: customPrompt || 'Modern clean design.' },
+    custom_3: { name: 'Custom Style 3', guide: customPrompt || 'Modern clean design.' },
   };
 
   const sg = styleGuides[style] || styleGuides.minimal;
   // For any custom_N key always inject the actual prompt so it overrides the placeholder
   if (style.startsWith('custom') && customPrompt) {
     sg.guide = customPrompt;
-    sg.name  = style === 'custom' ? 'Custom Design'
-             : `Custom Style ${style.replace('custom_', '')}`;
+    sg.name = style === 'custom' ? 'Custom Design'
+      : `Custom Style ${style.replace('custom_', '')}`;
   }
 
   const frameworkInstructions = {
@@ -357,10 +357,10 @@ Start your response with: <!DOCTYPE html>`;
   // We skip live conversion to avoid timeouts. User downloads HTML and can
   // copy-paste into their framework or use an online converter.
   const frameworkNotes = {
-    html:    '',
-    react:   `/* To use in React:\n   1. Create a new .jsx file\n   2. Paste the HTML structure into JSX (convert class → className, style strings → objects)\n   3. Or use dangerouslySetInnerHTML to embed this HTML directly\n   4. Recommended: use https://transform.tools/html-to-jsx to convert automatically\n*/\n\n`,
-    nextjs:  `/* To use in Next.js:\n   1. Create app/page.jsx or pages/index.jsx\n   2. Paste the HTML into a component with dangerouslySetInnerHTML\n   3. Or convert to JSX using https://transform.tools/html-to-jsx\n   4. Move <style> contents to a .module.css file\n*/\n\n`,
-    vue:     `<!-- To use in Vue.js:\n  1. Create a .vue file\n  2. Paste HTML into <template>, CSS into <style scoped>\n  3. Or use this HTML directly via v-html directive\n  4. Recommended: https://transform.tools/ for conversion\n-->\n\n`,
+    html: '',
+    react: `/* To use in React:\n   1. Create a new .jsx file\n   2. Paste the HTML structure into JSX (convert class → className, style strings → objects)\n   3. Or use dangerouslySetInnerHTML to embed this HTML directly\n   4. Recommended: use https://transform.tools/html-to-jsx to convert automatically\n*/\n\n`,
+    nextjs: `/* To use in Next.js:\n   1. Create app/page.jsx or pages/index.jsx\n   2. Paste the HTML into a component with dangerouslySetInnerHTML\n   3. Or convert to JSX using https://transform.tools/html-to-jsx\n   4. Move <style> contents to a .module.css file\n*/\n\n`,
+    vue: `<!-- To use in Vue.js:\n  1. Create a .vue file\n  2. Paste HTML into <template>, CSS into <style scoped>\n  3. Or use this HTML directly via v-html directive\n  4. Recommended: https://transform.tools/ for conversion\n-->\n\n`,
     angular: `/* To use in Angular:\n   1. Paste HTML into component template\n   2. Move CSS into component styles array\n   3. Replace class attributes (no changes needed for Angular)\n   4. Or use [innerHTML] binding to embed directly\n*/\n\n`,
   };
 
@@ -407,6 +407,7 @@ const redesignWebsite = async (req, res) => {
     sendSSE(res, 'status', { message: 'Scraping site & generating redesigns…' });
     console.log('[Redesigner] Scraping:', websiteUrl);
 
+
     const [screenshotBase64, content] = await Promise.all([
       screenshotWebsite(websiteUrl),
       scrapePageContent(websiteUrl),
@@ -439,11 +440,11 @@ const redesignWebsite = async (req, res) => {
       screenshotBase64,
       totalDesigns: allStyles.length,
       stats: {
-        headings:  content.h1s.length + content.h2s.length + content.h3s.length,
+        headings: content.h1s.length + content.h2s.length + content.h3s.length,
         paragraphs: content.paras.length,
-        listItems:  content.allListItems.length,
-        tags:       content.badges.length,
-        sections:   content.sections.length,
+        listItems: content.allListItems.length,
+        tags: content.badges.length,
+        sections: content.sections.length,
       },
     });
 

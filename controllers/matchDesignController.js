@@ -488,6 +488,7 @@ const matchDesign = async (req, res) => {
     const { matchScore, projectedScore } = computeScores(matchPct, cssIssues.length);
     console.log(`[MatchDesign] Done. Pixel match: ${matchPct}%, Final score: ${matchScore}%, Issues: ${allMismatches.length}`);
 
+    // Part E: return screenshots so frontend can overlay bounding boxes
     return res.status(200).json({
       success: true,
       mismatches: allMismatches,
