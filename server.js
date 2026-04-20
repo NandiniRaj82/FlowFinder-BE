@@ -51,11 +51,11 @@ app.use((req, res, next) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/accessibility', accessibilityRoutes);
 app.use('/api/match-design', (req, res, next) => {
-    // 3 minutes — enough for Puppeteer + Figma API + Gemini in parallel
-    req.socket.setTimeout(180000);
-    res.setTimeout(180000);
+    res.setTimeout(300000); // 5 minutes
+    req.setTimeout(300000);
     next();
 }, require('./router/matchDesignRoute'));
+
 app.use('/api/redesign', require('./router/designSuggesterRoute'));
 app.get('/api/health', (req, res) => {
     res.status(200).json({
