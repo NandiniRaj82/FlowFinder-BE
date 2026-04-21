@@ -1,14 +1,24 @@
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const morgan = require('morgan');
 const path = require('path');
 const fs = require('fs');
 require('dotenv').config();
+
+// ── Firebase Admin (must init before auth middleware is used) ─────────────────
+const { initFirebase } = require('./config/firebase');
+initFirebase();
 
 const app = express();
 const port = process.env.PORT || 5000;
 const connectDB = require('./config/db');
 const authRoutes = require('./router/auth');
 const accessibilityRoutes = require('./router/accessibility');
+const githubRoutes = require('./router/github');
+const scanRoutes = require('./router/scans');
+const fixRoutes = require('./router/fixes');
+const lighthouseRoutes = require('./router/lighthouse');
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -19,12 +29,29 @@ if (!fs.existsSync(uploadsDir)) {
 // Connect to Database
 connectDB();
 
-// CORS Configuration with increased limits
+// ── Security headers ─────────────────────────────────────────────────────────
+app.use(helmet({ crossOriginEmbedderPolicy: false, contentSecurityPolicy: false }));
+
+// ── Request logging ───────────────────────────────────────────────────────────
+if (process.env.NODE_ENV !== 'test') app.use(morgan('dev'));
+
+// ── CORS — env-driven for production safety ───────────────────────────────────
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:3000,http://localhost:3001').split(',');
 app.use(cors({
-    origin: ['http://localhost:3000', 'http://localhost:3001'], // Add your frontend URLs
+    origin: (origin, callback) => {
+        // Allow requests with no origin (mobile apps, curl, Postman)
+        if (!origin) return callback(null, true);
+        // Always allow Chrome/Firefox/Edge extensions
+        if (origin.startsWith('chrome-extension://') || origin.startsWith('moz-extension://')) {
+            return callback(null, true);
+        }
+        // Allow configured origins
+        if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+        callback(new Error(`CORS: ${origin} not allowed`));
+    },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
 // Body Parser Middleware with 200MB limits
@@ -47,23 +74,36 @@ app.use((req, res, next) => {
     next();
 });
 
-// Routes
+// ── Routes ───────────────────────────────────────────────────────────────────
+// Legacy auth (kept for backward compat — will deprecate when all clients use Firebase)
 app.use('/api/auth', authRoutes);
+
+// Core feature routes
 app.use('/api/accessibility', accessibilityRoutes);
 app.use('/api/match-design', (req, res, next) => {
-    res.setTimeout(300000); // 5 minutes
+    res.setTimeout(300000);
     req.setTimeout(300000);
     next();
 }, require('./router/matchDesignRoute'));
-
 app.use('/api/redesign', require('./router/designSuggesterRoute'));
+
+// ── NEW production routes ────────────────────────────────────────────────────
+app.use('/api/github', githubRoutes);
+app.use('/api/scans', scanRoutes);
+app.use('/api/fixes', fixRoutes);
+app.use('/api/lighthouse', lighthouseRoutes);
+
+// Health check
 app.get('/api/health', (req, res) => {
+    const { getAuth } = require('./config/firebase');
     res.status(200).json({
         success: true,
-        message: 'Server is running',
-        aiProvider: 'Google Gemini',
-        geminiApiConfigured: !!process.env.GEMINI_API_KEY,
-        maxFileSize: '200MB'
+        message: 'FlowFinder API running',
+        version: '2.0.0',
+        firebase: getAuth() !== null,
+        github: !!(process.env.GITHUB_CLIENT_ID && process.env.GITHUB_CLIENT_ID !== 'REPLACE_WITH_YOUR_GITHUB_CLIENT_ID'),
+        gemini: !!process.env.GEMINI_API_KEY,
+        mongo: require('mongoose').connection.readyState === 1,
     });
 });
 

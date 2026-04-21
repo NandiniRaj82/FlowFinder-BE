@@ -509,4 +509,124 @@ const matchDesign = async (req, res) => {
   }
 };
 
-module.exports = { matchDesign };
+/* ─────────────────────────────────────────────────────────────────────────────
+   generateDesignFix
+   POST /api/match-design/fix
+   Body: { mismatches, websiteUrl, repoFullName, githubToken }
+   Maps design mismatches to source files and generates CSS/style fix diffs
+──────────────────────────────────────────────────────────────────────────────*/
+const { GoogleGenerativeAI } = require('@google/generative-ai');
+const FixSession = require('../models/FixSession');
+
+const generateDesignFix = async (req, res) => {
+  const { mismatches, websiteUrl, repoFullName } = req.body;
+  if (!mismatches?.length || !repoFullName) {
+    return res.status(400).json({ success: false, message: 'mismatches and repoFullName are required.' });
+  }
+
+  try {
+    const { Octokit } = require('@octokit/rest');
+    const octokit = new Octokit({ auth: req.user?.githubToken });
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+
+    const [owner, repo] = repoFullName.split('/');
+
+    // Fetch repo tree to find CSS/style files
+    const { data: treeData } = await octokit.git.getTree({
+      owner, repo, tree_sha: 'HEAD', recursive: '1',
+    });
+
+    const styleFiles = treeData.tree
+      .filter(f => f.type === 'blob' && /\.(css|scss|less|sass|module\.css|styled\.(ts|tsx|js))$/i.test(f.path))
+      .slice(0, 20); // cap to avoid rate limits
+
+    // Fetch content of each style file
+    const fileContents = await Promise.all(styleFiles.map(async (file) => {
+      try {
+        const { data } = await octokit.repos.getContent({ owner, repo, path: file.path });
+        const content = Buffer.from(data.content, 'base64').toString('utf-8');
+        return { path: file.path, content: content.slice(0, 8000) }; // cap size
+      } catch { return null; }
+    }));
+
+    const validFiles = fileContents.filter(Boolean);
+
+    // Build Gemini prompt
+    const mismatchSummary = mismatches
+      .slice(0, 15)
+      .map((m, i) => `${i + 1}. [${m.category || 'style'}] ${m.description || m.issue || JSON.stringify(m)}`)
+      .join('\n');
+
+    const filesContext = validFiles
+      .map(f => `### FILE: ${f.path}\n\`\`\`css\n${f.content}\n\`\`\``)
+      .join('\n\n');
+
+    const prompt = `You are an expert frontend engineer. 
+A visual comparison between a live website (${websiteUrl}) and its Figma design found these mismatches:
+
+${mismatchSummary}
+
+Here are the project's style files:
+${filesContext}
+
+For each mismatch you can fix in a style file, output a JSON array of fix objects:
+[
+  {
+    "filePath": "path/to/file.css",
+    "changes": [
+      {
+        "original": "exact CSS selector or rule to replace",
+        "fixed": "the corrected CSS",
+        "reason": "brief explanation"
+      }
+    ],
+    "confidence": 75
+  }
+]
+
+Rules:
+- Only include files from the list above
+- Only fix actual style mismatches (colors, fonts, spacing, sizing)
+- Keep changes minimal and targeted
+- confidence = 0–100 based on how certain you are
+- Output ONLY the JSON array, no markdown wrapper`;
+
+    const result = await model.generateContent(prompt);
+    const raw = result.response.text();
+    const jsonMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
+    if (!jsonMatch) throw new Error('Gemini returned no parseable fix JSON');
+    const mappedFiles = JSON.parse(jsonMatch[0]);
+
+    // Persist as FixSession
+    const session = await FixSession.create({
+      userId: req.user?.uid,
+      scanId: null,
+      repoFullName,
+      fixType: 'design',
+      websiteUrl,
+      mappedFiles,
+      unmappedErrors: mismatches.filter(m =>
+        !mappedFiles.some(f => f.changes?.some(c => c.reason?.toLowerCase().includes(m.category?.toLowerCase())))
+      ),
+      status: 'pending',
+      framework: 'css',
+    });
+
+    return res.json({
+      success: true,
+      sessionId: session._id,
+      mappedFiles,
+      unmappedErrors: [],
+      totalMismatches: mismatches.length,
+      fixedMismatches: mappedFiles.reduce((s, f) => s + (f.changes?.length || 0), 0),
+      filesChanged: mappedFiles.length,
+    });
+
+  } catch (err) {
+    console.error('[DesignFix] Error:', err.message);
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+module.exports = { matchDesign, generateDesignFix };
