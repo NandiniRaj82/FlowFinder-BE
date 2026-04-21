@@ -6,6 +6,10 @@ node_modules/
 .env.local
 .env.*.local
 
+# Firebase service account (NEVER commit this)
+config/firebase-service-account.json
+config/*.json
+
 # Uploads directory (temporary files)
 uploads/
 uploads/*

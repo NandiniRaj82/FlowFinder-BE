@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/auth');
-const { matchDesign } = require('../controllers/matchDesignController');
+const { matchDesign, generateDesignFix } = require('../controllers/matchDesignController');
 
 /**
  * POST /api/match-design
@@ -13,4 +13,11 @@ router.post('/', authMiddleware, (req, res, next) => {
   next();
 }, matchDesign);
 
-module.exports = router;
+/**
+ * POST /api/match-design/fix
+ * Generate CSS source fixes from mismatch data
+ */
+router.post('/fix', authMiddleware, generateDesignFix);
+
+module.exports = router;
+
