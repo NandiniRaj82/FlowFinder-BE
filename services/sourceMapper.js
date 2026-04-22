@@ -241,82 +241,200 @@ function mergeCandidates(...candidateLists) {
   return [...merged.values()].sort((a, b) => b.score - a.score).slice(0, 5);
 }
 
-// ─── Layer 4: Gemini AI Confirmation + Fix Generation ────────────────────────
-async function geminiConfirmAndFix(error, candidates, framework) {
-  if (candidates.length === 0) return { bestFile: null, confidence: 0, suggestedFix: null };
+// ─── Layer 4: Gemini AI — Full-file fix generation ───────────────────────────
+// KEY DESIGN: instead of asking for originalCode/fixedCode snippets (fragile,
+// fails fuzzyReplace), we send the ENTIRE file and ask Gemini to return the
+// COMPLETE fixed file. This guarantees fixedContent !== content.
+const MAX_FULL_FILE = 40000; // chars — Gemini output cap ~50k
 
+async function geminiConfirmAndFix(error, candidates, framework, repoFiles) {
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
-  const candidateContext = candidates.slice(0, 3).map((c, i) => `
-=== Candidate ${i + 1}: ${c.filePath} (score: ${c.score}) ===
-Matched by: ${c.matchedBy.join(', ')}
-Code snippet:
-\`\`\`
-${c.snippet.slice(0, 800)}
-\`\`\`
-`).join('\n');
+  // Build candidate context: for top candidate, include full file if small enough
+  const topCandidates = candidates.slice(0, 3);
 
-  const prompt = `You are an expert accessibility engineer. An automated tool found this accessibility issue on a rendered webpage:
+  // If no candidates, ask Gemini to pick a file from all available files
+  if (topCandidates.length === 0) {
+    if (!repoFiles || repoFiles.length === 0) {
+      return { bestFile: null, confidence: 0 };
+    }
 
-ACCESSIBILITY ERROR:
+    // Send file listing with short preview so Gemini can pick the best one
+    const fileList = repoFiles.slice(0, 30).map(f =>
+      `- ${f.filePath} (${f.content.length} chars)\n  Preview: ${f.content.slice(0, 150).replace(/\n/g, ' ')}`
+    ).join('\n');
+
+    const pickPrompt = `You are an expert accessibility engineer. This accessibility error was found on a rendered webpage:
+
+ERROR:
 - Type: ${error.type || error.title || 'Unknown'}
 - Impact: ${error.impact || 'unknown'}
 - Message: ${error.message || error.description || ''}
 - CSS Selector: ${error.selector || 'N/A'}
-- Rendered Element: ${(error.element || '').slice(0, 300)}
+- HTML Element: ${(error.element || '').slice(0, 400)}
 
-I found these candidate source files that might contain the problematic element:
+No candidate files were found by text/selector matching. Here are all available source files:
 
-${candidateContext}
+${fileList}
 
-TASK:
-1. Identify which candidate file (if any) contains the element causing this accessibility issue.
-2. If found, generate the MINIMAL fix for the accessibility issue in that file.
-3. The fix must not break any existing functionality.
+Which file is MOST LIKELY to contain the source code for this element?
+Framework: ${framework || 'React/Next.js'}
 
-Framework/tech stack hint: ${framework || 'React/Next.js'}
+Respond in JSON:
+{"bestFile": "path/to/file or null", "confidence": 0-100, "reasoning": "..."}
+Return ONLY valid JSON.`;
 
-Respond in this exact JSON format:
-{
-  "bestFile": "path/to/file.tsx or null",
-  "confidence": 0-100,
-  "reasoning": "brief explanation",
-  "originalCode": "the exact problematic code snippet",
-  "fixedCode": "the fixed version with minimal changes",
-  "explanation": "what was changed and why (WCAG reference)"
+    try {
+      const r = await model.generateContent(pickPrompt);
+      const text = r.response.text().trim();
+      const m = text.match(/\{[\s\S]*\}/);
+      if (!m) return { bestFile: null, confidence: 0 };
+      const pick = JSON.parse(m[0]);
+      if (!pick.bestFile) return { bestFile: null, confidence: 0 };
+      // Now run the full fix on the picked file
+      const pickedFile = repoFiles.find(f => f.filePath === pick.bestFile);
+      if (!pickedFile) return { bestFile: null, confidence: 0 };
+      return geminiFixFile(error, pickedFile, pick.confidence, pick.reasoning, framework, model);
+    } catch (e) {
+      console.warn('[SourceMapper] Gemini pick failed:', e.message);
+      return { bestFile: null, confidence: 0 };
+    }
+  }
+
+  // We have candidates — run full-file fix on the best candidate
+  const bestCandidate = topCandidates[0];
+  const fileData = repoFiles?.find(f => f.filePath === bestCandidate.filePath);
+  if (!fileData) return { bestFile: bestCandidate.filePath, confidence: 20 };
+
+  return geminiFixFile(error, fileData, bestCandidate.score, bestCandidate.matchedBy.join(', '), framework, model);
 }
 
-Return ONLY valid JSON.`;
+/**
+ * Send a single file + error to Gemini and get back the COMPLETE fixed file content.
+ * For files > MAX_FULL_FILE chars, falls back to snippet approach.
+ */
+async function geminiFixFile(error, fileData, score, matchReason, framework, model) {
+  const { filePath, content } = fileData;
+  const isLargeFile = content.length > MAX_FULL_FILE;
+
+  const errorDesc = `
+Error Type: ${error.type || error.title || 'Unknown'}
+Impact: ${error.impact || 'unknown'}
+Message: ${error.message || error.description || ''}
+CSS Selector: ${error.selector || 'N/A'}
+HTML Element: ${(error.element || '').slice(0, 400)}`.trim();
+
+  let prompt;
+
+  if (!isLargeFile) {
+    // ── Full-file approach (preferred) ──────────────────────────────────────
+    prompt = `You are an expert accessibility engineer fixing WCAG violations.
+
+ACCESSIBILITY ERROR FOUND ON RENDERED PAGE:
+${errorDesc}
+
+SOURCE FILE (${framework || 'React/Next.js'}): ${filePath}
+\`\`\`
+${content}
+\`\`\`
+
+TASK:
+1. Fix the accessibility issue in the file above.
+2. Make ONLY the minimal changes needed. Do NOT refactor or change anything else.
+3. Return the COMPLETE file with your fix applied — every single line, unchanged lines included.
+
+Respond ONLY with this JSON (no markdown, no explanation outside JSON):
+{
+  "bestFile": "${filePath}",
+  "confidence": 0-100,
+  "reasoning": "brief explanation of why this file contains the issue",
+  "fullFixedContent": "COMPLETE FIXED FILE CONTENT HERE — all lines",
+  "explanation": "what was changed and which WCAG criterion it fixes",
+  "changeDescription": "one-line summary"
+}`;
+  } else {
+    // ── Snippet approach for large files ────────────────────────────────────
+    // Find the relevant section by selector/text and send ±80 lines around it
+    const lines = content.split('\n');
+    let focusLine = 0;
+    const selector = error.selector || '';
+    const texts = (error.element || '').match(/>([^<]{3,60})</g) || [];
+    const searchTerms = [
+      ...extractIdentifiersFromSelector2(selector),
+      ...texts.map(t => t.replace(/^>|<$/g, '').trim()).filter(Boolean),
+    ];
+    for (let i = 0; i < lines.length; i++) {
+      if (searchTerms.some(t => lines[i].includes(t))) { focusLine = i; break; }
+    }
+    const start = Math.max(0, focusLine - 80);
+    const end = Math.min(lines.length, focusLine + 120);
+    const snippet = lines.slice(start, end).join('\n');
+    const snippetLines = `lines ${start + 1}–${end}`;
+
+    prompt = `You are an expert accessibility engineer.
+
+ACCESSIBILITY ERROR:
+${errorDesc}
+
+FILE: ${filePath} (large file — showing ${snippetLines} of ${lines.length} total)
+\`\`\`
+${snippet}
+\`\`\`
+
+TASK: Fix the accessibility issue in the snippet above.
+Return ONLY this JSON:
+{
+  "bestFile": "${filePath}",
+  "confidence": 0-100,
+  "reasoning": "why this file contains the issue",
+  "originalCode": "exact lines to replace (copy verbatim from snippet above, no paraphrasing)",
+  "fixedCode": "the replacement lines",
+  "explanation": "what changed and why (WCAG ref)",
+  "changeDescription": "one-line summary",
+  "snippetStart": ${start}
+}`;
+  }
 
   try {
     const result = await model.generateContent(prompt);
     const text = result.response.text().trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) return { bestFile: candidates[0]?.filePath || null, confidence: 30, suggestedFix: null };
-    return JSON.parse(jsonMatch[0]);
+    // Strip markdown code fences if present
+    const cleaned = text.replace(/^```json\s*/i, '').replace(/\s*```\s*$/, '');
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      console.warn('[SourceMapper] Gemini returned no JSON for', filePath);
+      return { bestFile: filePath, confidence: 20 };
+    }
+    const parsed = JSON.parse(jsonMatch[0]);
+    return { ...parsed, bestFile: parsed.bestFile || filePath };
   } catch (err) {
-    console.warn('[SourceMapper] Gemini confirm failed:', err.message);
-    return {
-      bestFile: candidates[0]?.filePath || null,
-      confidence: 25,
-      suggestedFix: null,
-      reasoning: 'Gemini unavailable — top candidate used',
-    };
+    console.warn('[SourceMapper] Gemini fix failed for', filePath, ':', err.message);
+    return { bestFile: filePath, confidence: 15 };
   }
+}
+
+// Helper for large-file search (inline, no import needed)
+function extractIdentifiersFromSelector2(selector) {
+  if (!selector) return [];
+  const out = [];
+  const cls = selector.match(/\.([a-zA-Z][a-zA-Z0-9_-]{2,})/g);
+  if (cls) out.push(...cls.map(c => c.slice(1)));
+  const ids = selector.match(/#([a-zA-Z][a-zA-Z0-9_-]{2,})/g);
+  if (ids) out.push(...ids.map(id => id.slice(1)));
+  return out;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 /**
- * Map accessibility errors to source files.
+ * Map accessibility errors to source files AND generate complete fixed file content.
  * @param {AccessibilityError[]} errors
  * @param {RepoFile[]} repoFiles - array of { filePath, content }
- * @param {string} framework - 'react'|'nextjs'|'vue'|'html' etc.
+ * @param {string} framework
  * @returns {Promise<MappedError[]>}
  */
 async function mapErrorsToSource(errors, repoFiles, framework = 'react') {
   console.log(`[SourceMapper] Mapping ${errors.length} errors across ${repoFiles.length} files`);
 
-  // Filter to only source files we can actually analyse
   const sourceFiles = repoFiles.filter(f =>
     SOURCE_EXTENSIONS.test(f.filePath) &&
     !SKIP_EXTENSIONS.test(f.filePath) &&
@@ -328,32 +446,39 @@ async function mapErrorsToSource(errors, repoFiles, framework = 'react') {
 
   const mapped = [];
 
-  for (const error of errors) {
-    // Run all 3 local layers in parallel
-    const [textCandidates, selectorCandidates, structureCandidates] = await Promise.all([
-      Promise.resolve(textContentMatch(error, sourceFiles)),
-      Promise.resolve(selectorGrepMatch(error, sourceFiles)),
-      Promise.resolve(structureMatch(error, sourceFiles)),
-    ]);
+  // Process errors concurrently (max 3 at a time to avoid rate limits)
+  const CONCURRENCY = 3;
+  for (let i = 0; i < errors.length; i += CONCURRENCY) {
+    const batch = errors.slice(i, i + CONCURRENCY);
+    const results = await Promise.all(batch.map(async (error) => {
+      const [textCandidates, selectorCandidates, structureCandidates] = await Promise.all([
+        Promise.resolve(textContentMatch(error, sourceFiles)),
+        Promise.resolve(selectorGrepMatch(error, sourceFiles)),
+        Promise.resolve(structureMatch(error, sourceFiles)),
+      ]);
 
-    const merged = mergeCandidates(textCandidates, selectorCandidates, structureCandidates);
+      const merged = mergeCandidates(textCandidates, selectorCandidates, structureCandidates);
 
-    // Only call Gemini if we have at least one candidate
-    let geminiResult = { bestFile: null, confidence: 0, suggestedFix: null };
-    if (merged.length > 0) {
-      geminiResult = await geminiConfirmAndFix(error, merged, framework);
-    }
+      // ALWAYS call Gemini — even with no candidates (it will pick a file from the full list)
+      const geminiResult = await geminiConfirmAndFix(error, merged, framework, sourceFiles);
 
-    mapped.push({
-      error,
-      candidates: merged,
-      bestFile: geminiResult.bestFile,
-      confidence: geminiResult.confidence || 0,
-      originalCode: geminiResult.originalCode || null,
-      fixedCode: geminiResult.fixedCode || null,
-      explanation: geminiResult.explanation || null,
-      reasoning: geminiResult.reasoning || null,
-    });
+      return {
+        error,
+        candidates: merged,
+        bestFile: geminiResult.bestFile || null,
+        confidence: geminiResult.confidence || 0,
+        // Full file approach
+        fullFixedContent: geminiResult.fullFixedContent || null,
+        // Snippet approach fallback
+        originalCode: geminiResult.originalCode || null,
+        fixedCode: geminiResult.fixedCode || null,
+        snippetStart: geminiResult.snippetStart ?? null,
+        explanation: geminiResult.explanation || null,
+        changeDescription: geminiResult.changeDescription || null,
+        reasoning: geminiResult.reasoning || null,
+      };
+    }));
+    mapped.push(...results);
   }
 
   console.log(`[SourceMapper] Mapped ${mapped.filter(m => m.bestFile).length}/${errors.length} errors to source files`);

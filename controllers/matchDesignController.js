@@ -4,6 +4,8 @@ const axios = require('axios');
 const { Jimp } = require('jimp');   // v1 named export
 const { PNG } = require('pngjs');
 const pixelmatch = require('pixelmatch');
+const DesignScan = require('../models/designScan');
+const UserProfile = require('../models/userProfile');
 
 /* ─── URL helpers ────────────────────────────────────────────────────────── */
 function extractFigmaFileKey(url) {
@@ -116,7 +118,8 @@ async function extractLiveStyles(url) {
       document.querySelectorAll(TAGS).forEach(el => {
         const rect = el.getBoundingClientRect();
         if (rect.width < 2 || rect.height < 2) return;
-        if (rect.top > 12000) return;
+        // No hard cap — extract styles for the full page
+        if (rect.top > 30000) return;
         const cs = window.getComputedStyle(el);
         results.push({
           tag: el.tagName.toLowerCase(),
@@ -219,7 +222,7 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
     x: Math.max(0, Math.round((box.x / pgW) * 100)),
     y: Math.max(0, Math.round((box.y / pgH) * 100)),
     width: Math.min(100, Math.round((box.width / pgW) * 100)),
-    height: Math.min(40, Math.max(2, Math.round((box.height / pgH) * 100))),
+    height: Math.min(90, Math.max(2, Math.round((box.height / pgH) * 100))),
   } : { x: 0, y: 0, width: 100, height: 5 };
 
   const closest = (box) => {
@@ -231,7 +234,7 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
       const d = Math.hypot(dx, dy);
       if (d < bd) { bd = d; best = el; }
     }
-    return bd < 350 ? best : null;
+    return bd < 600 ? best : null;
   };
 
   for (const fn of figmaNodes) {
@@ -335,7 +338,13 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
   return issues;
 }
 
-/* ─── Layer 3: Pixel diff using pixelmatch ───────────────────────────────── */
+/* ─── Layer 3: Chunked pixel diff — full height, no gaps ────────────────── */
+// CRITICAL FIX: we use MAX(liveH, figmaH) as the comparison height.
+// Whichever image is shorter is padded with a contrasting fill (magenta) so
+// every pixel of the taller image gets compared instead of being silently dropped.
+const CHUNK_H = 2000;  // pixels per strip — keeps RAM constant
+const PAD_FILL = [255, 0, 255, 255]; // magenta = guaranteed diff pixel
+
 async function runPixelDiff(livePngBuf, figmaBuf) {
   const parsePng = buf => new Promise((res, rej) => { const p = new PNG(); p.parse(buf, (e, d) => e ? rej(e) : res(d)); });
 
@@ -343,50 +352,170 @@ async function runPixelDiff(livePngBuf, figmaBuf) {
   let figmaPng;
   try { figmaPng = await parsePng(figmaBuf); }
   catch {
-    // Figma image might not be a valid PNG — convert via Jimp
     const j = await Jimp.fromBuffer(figmaBuf);
     const pngBuf = await j.getBuffer('image/png');
     figmaPng = await parsePng(pngBuf);
   }
 
   const W = Math.min(livePng.width, figmaPng.width, 1440);
-  const H = Math.min(livePng.height, figmaPng.height, 5000);
+  // Use MAX height — the shorter image is padded so no pixels are skipped
+  const liveH = livePng.height;
+  const figmaH = figmaPng.height;
+  const H = Math.max(liveH, figmaH);
+  const layoutDivergence = Math.round((Math.abs(liveH - figmaH) / H) * 100);
 
-  // Resize both images to same W×H using Jimp v1 API
-  const toRGBA = async (pngData, w, h) => {
-    const rawBuf = Buffer.from(PNG.sync.write(pngData));
-    const j = await Jimp.fromBuffer(rawBuf);
-    j.resize({ w, h });                    // v1: resize takes an object
-    const buf = Buffer.alloc(w * h * 4);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const i = (y * w + x) * 4;
-        const hex = j.getPixelColor(x, y); // returns RGBA int
-        buf[i] = (hex >>> 24) & 0xff;
-        buf[i + 1] = (hex >>> 16) & 0xff;
-        buf[i + 2] = (hex >>> 8) & 0xff;
-        buf[i + 3] = hex & 0xff;
+  console.log(`[MatchDesign] Pixel diff: ${W}x${H}px (live=${liveH}px figma=${figmaH}px) in ${Math.ceil(H / CHUNK_H)} chunk(s)`);
+
+  // Extract RGBA strip — pads with PAD_FILL if strip extends beyond image height
+  const getStrip = async (pngData, yStart, yEnd, targetW) => {
+    const stripH = yEnd - yStart;
+    const actualH = Math.max(0, Math.min(pngData.height - yStart, stripH)); // real pixels available
+    const buf = Buffer.alloc(targetW * stripH * 4, 0);
+
+    if (actualH > 0) {
+      // Write PNG to buffer then use Jimp to crop+resize only the real section
+      const rawBuf = Buffer.from(PNG.sync.write(pngData));
+      const j = await Jimp.fromBuffer(rawBuf);
+      j.crop({ x: 0, y: yStart, w: Math.min(pngData.width, targetW + 10), h: actualH });
+      j.resize({ w: targetW, h: actualH }); // resize ONLY the real part
+
+      for (let y = 0; y < actualH; y++) {
+        for (let x = 0; x < targetW; x++) {
+          const i = (y * targetW + x) * 4;
+          const hex = j.getPixelColor(x, y);
+          buf[i]     = (hex >>> 24) & 0xff;
+          buf[i + 1] = (hex >>> 16) & 0xff;
+          buf[i + 2] = (hex >>>  8) & 0xff;
+          buf[i + 3] =  hex         & 0xff;
+        }
+      }
+    }
+
+    // Pad the remaining rows with contrasting color (guaranteed diff)
+    for (let y = actualH; y < stripH; y++) {
+      for (let x = 0; x < targetW; x++) {
+        const i = (y * targetW + x) * 4;
+        buf[i] = PAD_FILL[0]; buf[i+1] = PAD_FILL[1]; buf[i+2] = PAD_FILL[2]; buf[i+3] = PAD_FILL[3];
       }
     }
     return buf;
   };
 
-  const [liveRGBA, figmaRGBA] = await Promise.all([toRGBA(livePng, W, H), toRGBA(figmaPng, W, H)]);
-  const diffBuf = Buffer.alloc(W * H * 4);
-  const numDiff = pixelmatch(liveRGBA, figmaRGBA, diffBuf, W, H, { threshold: 0.15, includeAA: false });
-  const matchPct = Math.max(0, Math.min(100, Math.round((1 - numDiff / (W * H)) * 100)));
+  let totalDiffPixels = 0;
+  const allClusters = [];
+  const diffStrips = [];
+  // Section heatmap: 10 vertical bands, each gets a match %
+  const SECTIONS = 10;
+  const sectionDiffPixels = new Array(SECTIONS).fill(0);
+  const sectionTotalPixels = new Array(SECTIONS).fill(0);
 
-  const diffPng = new PNG({ width: W, height: H });
-  diffBuf.copy(diffPng.data);
-  const diffBase64 = PNG.sync.write(diffPng).toString('base64');
+  for (let yStart = 0; yStart < H; yStart += CHUNK_H) {
+    const yEnd = Math.min(yStart + CHUNK_H, H);
+    const stripH = yEnd - yStart;
 
-  const clusters = clusterDiffRegions(diffBuf, W, H);
-  return { matchPct, diffBase64, clusters, W, H };
+    const [liveRGBA, figmaRGBA] = await Promise.all([
+      getStrip(livePng, yStart, yEnd, W),
+      getStrip(figmaPng, yStart, yEnd, W),
+    ]);
+
+    const diffBuf = Buffer.alloc(W * stripH * 4);
+    const numDiff = pixelmatch(liveRGBA, figmaRGBA, diffBuf, W, stripH, {
+      threshold: 0.12,  // more sensitive than before
+      includeAA: false,
+      alpha: 0.1,
+    });
+    totalDiffPixels += numDiff;
+
+    // Accumulate section heatmap
+    for (let row = 0; row < stripH; row++) {
+      const absY = yStart + row;
+      const sectionIdx = Math.min(SECTIONS - 1, Math.floor((absY / H) * SECTIONS));
+      for (let col = 0; col < W; col++) {
+        const i = (row * W + col) * 4;
+        sectionTotalPixels[sectionIdx]++;
+        // pixelmatch marks diff pixels with non-zero alpha in the output
+        if (diffBuf[i + 3] > 10 || (diffBuf[i] > 100 && diffBuf[i+1] < 50)) {
+          sectionDiffPixels[sectionIdx]++;
+        }
+      }
+    }
+
+    // Collect clusters from this strip, offset y back to full-image coordinates
+    const stripClusters = clusterDiffRegions(diffBuf, W, stripH);
+    for (const c of stripClusters) {
+      const absYPct = Math.round(((yStart + (c.y / 100) * stripH) / H) * 100);
+      const absHPct = Math.max(1, Math.round((c.height / 100) * (stripH / H) * 100));
+      allClusters.push({ ...c, y: absYPct, height: absHPct });
+    }
+
+    const diffPngStrip = new PNG({ width: W, height: stripH });
+    diffBuf.copy(diffPngStrip.data);
+    diffStrips.push({ y: yStart, strip: diffPngStrip });
+  }
+
+  const matchPct = Math.max(0, Math.min(100, Math.round((1 - totalDiffPixels / (W * H)) * 100)));
+
+  // Per-section match scores (10 bands, top→bottom)
+  const sectionScores = sectionTotalPixels.map((total, i) =>
+    total === 0 ? 100 : Math.max(0, Math.min(100, Math.round((1 - sectionDiffPixels[i] / total) * 100)))
+  );
+
+  // Assemble output diff image (cap at 6000px height for payload)
+  const outH = Math.min(H, 6000);
+  const fullDiffPng = new PNG({ width: W, height: outH });
+  for (const { y, strip } of diffStrips) {
+    if (y >= outH) break;
+    const copyH = Math.min(strip.height, outH - y);
+    strip.data.copy(fullDiffPng.data, y * W * 4, 0, copyH * W * 4);
+  }
+  const diffBase64 = PNG.sync.write(fullDiffPng).toString('base64');
+
+  // Merge adjacent clusters (prevent cluster explosion on totally different pages)
+  const mergedClusters = mergeClusters(allClusters);
+
+  return { matchPct, diffBase64, clusters: mergedClusters.slice(0, 50), W, H, sectionScores, layoutDivergence };
+}
+
+// Merge clusters that are vertically AND horizontally overlapping (within 2% proximity)
+function mergeClusters(clusters) {
+  if (clusters.length === 0) return [];
+  const sorted = [...clusters].sort((a, b) => a.y - b.y);
+  const merged = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const last = merged[merged.length - 1];
+    const cur = sorted[i];
+    // Only merge if vertically close AND horizontally overlapping
+    const vertClose = cur.y <= last.y + last.height + 2;
+    const horizOverlap = cur.x < last.x + last.width + 5 && cur.x + cur.width > last.x - 5;
+    if (vertClose && horizOverlap) {
+      const newBottom = Math.max(last.y + last.height, cur.y + cur.height);
+      last.x = Math.min(last.x, cur.x);
+      last.width = Math.min(100, Math.max(last.x + last.width, cur.x + cur.width) - last.x);
+      last.height = newBottom - last.y;
+    } else {
+      merged.push({ ...cur });
+    }
+  }
+  // Cap any oversized cluster — split into smaller pieces if needed
+  const capped = [];
+  for (const c of merged) {
+    if (c.width > 55 && c.height > 25) {
+      // Split into 2 halves vertically
+      const half = Math.floor(c.height / 2);
+      capped.push({ x: c.x, y: c.y, width: c.width, height: half });
+      capped.push({ x: c.x, y: c.y + half, width: c.width, height: c.height - half });
+    } else {
+      // Cap dimensions
+      capped.push({ ...c, width: Math.min(55, c.width), height: Math.min(25, c.height) });
+    }
+  }
+  return capped;
 }
 
 /* ─── Cluster diff pixels → bounding boxes ──────────────────────────────── */
 function clusterDiffRegions(diffBuf, W, H) {
-  const BLOCK = 40; // group pixels into 40px blocks
+  const BLOCK = 60; // larger blocks = more isolated, tighter clusters
+  const MAX_CLUSTER_BLOCKS = 80; // prevent one cluster from swallowing the page
   const cols = Math.ceil(W / BLOCK), rows = Math.ceil(H / BLOCK);
   const blocks = new Uint8Array(cols * rows);
 
@@ -402,19 +531,21 @@ function clusterDiffRegions(diffBuf, W, H) {
   const visited = new Uint8Array(cols * rows);
   for (let by = 0; by < rows; by++) for (let bx = 0; bx < cols; bx++) {
     if (!blocks[by * cols + bx] || visited[by * cols + bx]) continue;
-    // Simple flood fill
+    // Flood fill with size limit
     const queue = [[bx, by]], inCluster = [[bx, by]];
     visited[by * cols + bx] = 1;
-    while (queue.length) {
+    while (queue.length && inCluster.length < MAX_CLUSTER_BLOCKS) {
       const [cx, cy] = queue.shift();
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]]) {
+      // 4-directional only (not 8-dir) — prevents diagonal cascade
+      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
         const nx = cx + dx, ny = cy + dy;
         if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
         if (visited[ny * cols + nx] || !blocks[ny * cols + nx]) continue;
+        if (inCluster.length >= MAX_CLUSTER_BLOCKS) break;
         visited[ny * cols + nx] = 1; queue.push([nx, ny]); inCluster.push([nx, ny]);
       }
     }
-    if (inCluster.length < 2) continue; // skip tiny single-block diffs
+    if (inCluster.length < 1) continue;
     const minBX = Math.min(...inCluster.map(c => c[0]));
     const maxBX = Math.max(...inCluster.map(c => c[0]));
     const minBY = Math.min(...inCluster.map(c => c[1]));
@@ -422,11 +553,11 @@ function clusterDiffRegions(diffBuf, W, H) {
     clusters.push({
       x: Math.round(((minBX * BLOCK) / W) * 100),
       y: Math.round(((minBY * BLOCK) / H) * 100),
-      width: Math.min(100, Math.round((((maxBX - minBX + 1) * BLOCK) / W) * 100)),
-      height: Math.min(40, Math.max(2, Math.round((((maxBY - minBY + 1) * BLOCK) / H) * 100))),
+      width: Math.min(55, Math.round((((maxBX - minBX + 1) * BLOCK) / W) * 100)),
+      height: Math.min(25, Math.max(1, Math.round((((maxBY - minBY + 1) * BLOCK) / H) * 100))),
     });
   }
-  return clusters.slice(0, 20); // cap at 20 pixel regions
+  return clusters;
 }
 
 /* ─── Merge CSS + pixel issues into final mismatch list ─────────────────── */
@@ -445,12 +576,56 @@ function buildMismatches(cssIssues, pixelClusters, startNum) {
   return [...cssIssues, ...pixelIssues];
 }
 
-/* ─── Score ──────────────────────────────────────────────────────────────── */
-function computeScores(matchPct, cssIssueCount) {
-  // Blend pixel score with CSS penalty
+/* ─── Score + structural analysis ───────────────────────────────────────── */
+function computeScores(matchPct, cssIssueCount, layoutDivergence = 0, sectionScores = []) {
   const cssPenalty = Math.min(30, cssIssueCount * 3);
   const matchScore = Math.max(0, Math.min(100, Math.round(matchPct - cssPenalty)));
-  return { matchScore, projectedScore: 100 };
+
+  // Honest projected score: we can only fix CSS/style issues, not layout restructuring
+  // If the pages are structurally divergent, projected improvement is bounded
+  const structuralDivergence = layoutDivergence + (matchPct < 30 ? 40 : matchPct < 50 ? 20 : 0);
+  const fixable = Math.min(cssPenalty + 10, 100 - matchScore); // realistic fixable margin
+  const projectedScore = Math.min(100, Math.round(matchScore + fixable));
+
+  // Classification
+  let verdict, verdictDetail;
+  if (matchScore >= 85) {
+    verdict = 'excellent';
+    verdictDetail = 'Minor polish needed — colours or spacing are slightly off.';
+  } else if (matchScore >= 65) {
+    verdict = 'good';
+    verdictDetail = 'Several style mismatches detected. CSS fixes should bring this close to design.';
+  } else if (matchScore >= 40) {
+    verdict = 'partial';
+    verdictDetail = 'Significant differences found. Some sections match; others need layout work.';
+  } else if (matchScore >= 15) {
+    verdict = 'divergent';
+    verdictDetail = 'Pages are structurally very different. This likely requires a layout redesign, not just CSS fixes.';
+  } else {
+    verdict = 'unrelated';
+    verdictDetail = 'These pages appear to be completely different designs. Pixel similarity is near 0%. A full redesign is needed.';
+  }
+
+  // Worst-performing section (for actionable callout)
+  let worstSection = null;
+  if (sectionScores.length > 0) {
+    const minScore = Math.min(...sectionScores);
+    const minIdx = sectionScores.indexOf(minScore);
+    worstSection = { sectionIndex: minIdx, matchPct: minScore, label: sectionLabel(minIdx, sectionScores.length) };
+  }
+
+  return { matchScore, projectedScore, verdict, verdictDetail, worstSection };
+}
+
+function sectionLabel(idx, total) {
+  const pct = Math.round((idx / total) * 100);
+  if (pct < 10) return 'Top (Hero / Header)';
+  if (pct < 25) return 'Upper section';
+  if (pct < 45) return 'Mid-upper section';
+  if (pct < 55) return 'Middle';
+  if (pct < 70) return 'Mid-lower section';
+  if (pct < 85) return 'Lower section';
+  return 'Bottom (Footer)';
 }
 
 /* ─── Main handler ───────────────────────────────────────────────────────── */
@@ -459,53 +634,116 @@ const matchDesign = async (req, res) => {
   if (!websiteUrl || !figmaUrl)
     return res.status(400).json({ success: false, message: 'Both website URL and Figma URL are required.' });
 
-  const figmaToken = process.env.FIGMA_API_TOKEN;
+  // Resolve Figma token: user's own token takes priority over env
+  const uid = req.user?.uid;
+  let figmaToken = process.env.FIGMA_API_TOKEN;
+  try {
+    const profile = await UserProfile.findOne({ uid }).select('figma.accessToken');
+    if (profile?.figma?.accessToken) figmaToken = profile.figma.accessToken;
+  } catch { /* use env fallback */ }
+
   if (!figmaToken)
-    return res.status(500).json({ success: false, message: 'FIGMA_API_TOKEN not set in .env' });
+    return res.status(400).json({ success: false, message: 'No Figma token configured. Add yours in Settings.' });
 
   try {
-    console.log('[MatchDesign] Step 1/4 — Animation-frozen screenshot:', websiteUrl);
+    console.log('[MatchDesign] Step 1/4 — Screenshot:', websiteUrl);
     const [livePngBuf, liveStyles] = await Promise.all([
       freezeAndScreenshot(websiteUrl),
       extractLiveStyles(websiteUrl),
     ]);
 
-    console.log('[MatchDesign] Step 2/4 — Fetching Figma data:', figmaUrl);
+    console.log('[MatchDesign] Step 2/4 — Fetching Figma:', figmaUrl);
     const { figmaBuf, figmaNodes } = await fetchFigmaData(figmaUrl, figmaToken);
 
-    console.log('[MatchDesign] Step 3/4 — Pixel diff comparison...');
-    const { matchPct, diffBase64, clusters, W, H } = await runPixelDiff(livePngBuf, figmaBuf);
+    console.log('[MatchDesign] Step 3/4 — Pixel diff...');
+    const { matchPct, diffBase64, clusters, W, H, sectionScores, layoutDivergence } = await runPixelDiff(livePngBuf, figmaBuf);
 
-    console.log('[MatchDesign] Step 4/4 — CSS token comparison...');
-    // Estimate page height from live screenshot buffer
+    console.log('[MatchDesign] Step 4/4 — CSS tokens...');
     const livePng = PNG.sync.read(livePngBuf);
     const cssIssues = compareStyles(liveStyles, figmaNodes, 1440, livePng.height || 5000);
 
     const allMismatches = buildMismatches(cssIssues, clusters, cssIssues.length + 1);
-    // Re-number everything
     allMismatches.forEach((m, i) => { m.issueNumber = i + 1; });
 
-    const { matchScore, projectedScore } = computeScores(matchPct, cssIssues.length);
-    console.log(`[MatchDesign] Done. Pixel match: ${matchPct}%, Final score: ${matchScore}%, Issues: ${allMismatches.length}`);
+    const { matchScore, projectedScore, verdict, verdictDetail, worstSection } =
+      computeScores(matchPct, cssIssues.length, layoutDivergence, sectionScores);
 
-    // Part E: return screenshots so frontend can overlay bounding boxes
+    console.log(`[MatchDesign] Done. Pixel: ${matchPct}%, Score: ${matchScore}% (${verdict}), Issues: ${allMismatches.length}`);
+
+    // ── Persist scan to DB (async, don't block response) ──────────────────
+    const websiteB64 = livePngBuf.toString('base64');
+    const figmaB64   = figmaBuf.toString('base64');
+    let savedScanId = null;
+    try {
+      const saved = await DesignScan.create({
+        userId: uid,
+        websiteUrl, figmaUrl,
+        matchScore, projectedScore, pixelMatchPercent: matchPct,
+        layoutDivergence, verdict, verdictDetail, sectionScores, worstSection,
+        totalIssues: allMismatches.length, mismatches: allMismatches,
+        websiteScreenshotBase64: websiteB64,
+        figmaScreenshotBase64: figmaB64,
+        diffImageBase64: diffBase64,
+        status: 'complete',
+      });
+      savedScanId = saved._id;
+    } catch (dbErr) {
+      console.error('[MatchDesign] DB save failed (non-fatal):', dbErr.message);
+    }
+
     return res.status(200).json({
       success: true,
+      scanId: savedScanId,
       mismatches: allMismatches,
       totalIssues: allMismatches.length,
-      matchScore,
-      projectedScore,
-      pixelMatchPercent: matchPct,
-      websiteUrl,
-      figmaUrl,
-      websiteScreenshotBase64: livePngBuf.toString('base64'),
-      figmaScreenshotBase64: figmaBuf.toString('base64'),
+      matchScore, projectedScore, verdict, verdictDetail,
+      pixelMatchPercent: matchPct, layoutDivergence, sectionScores, worstSection,
+      websiteUrl, figmaUrl,
+      websiteScreenshotBase64: websiteB64,
+      figmaScreenshotBase64: figmaB64,
       diffImageBase64: diffBase64,
     });
 
   } catch (error) {
     console.error('[MatchDesign] Error:', error.message);
     return res.status(500).json({ success: false, message: error.message || 'Comparison failed.' });
+  }
+};
+
+/* ─── GET /api/match-design/history ─────────────────────────────────────── */
+const getDesignHistory = async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const scans = await DesignScan.find({ userId: uid })
+      .sort({ createdAt: -1 })
+      .limit(30)
+      .select('-websiteScreenshotBase64 -figmaScreenshotBase64 -diffImageBase64 -mismatches');
+    return res.json({ success: true, scans });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/* ─── GET /api/match-design/:scanId ──────────────────────────────────────── */
+const getDesignScan = async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    const scan = await DesignScan.findOne({ _id: req.params.scanId, userId: uid });
+    if (!scan) return res.status(404).json({ success: false, message: 'Scan not found.' });
+    return res.json({ success: true, scan });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+};
+
+/* ─── DELETE /api/match-design/:scanId ───────────────────────────────────── */
+const deleteDesignScan = async (req, res) => {
+  try {
+    const uid = req.user?.uid;
+    await DesignScan.deleteOne({ _id: req.params.scanId, userId: uid });
+    return res.json({ success: true });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
   }
 };
 
@@ -517,106 +755,403 @@ const matchDesign = async (req, res) => {
 ──────────────────────────────────────────────────────────────────────────────*/
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const FixSession = require('../models/FixSession');
+const { getUserOctokit } = require('./githubController');
 
-const generateDesignFix = async (req, res) => {
-  const { mismatches, websiteUrl, repoFullName } = req.body;
-  if (!mismatches?.length || !repoFullName) {
-    return res.status(400).json({ success: false, message: 'mismatches and repoFullName are required.' });
+/* ─── Framework detection ─────────────────────────────────────────────────── */
+function detectFrameworkFromTree(tree, pkgJson) {
+  const paths = tree.map(f => f.path.toLowerCase());
+  const deps = { ...(pkgJson?.dependencies || {}), ...(pkgJson?.devDependencies || {}) };
+  const hasTailwind = !!deps.tailwindcss || paths.some(p => p.includes('tailwind.config'));
+  const hasBootstrap = !!deps.bootstrap;
+  const hasStyled = !!deps['styled-components'] || !!deps['@emotion/styled'];
+  if (paths.some(p => p.includes('next.config'))) return hasTailwind ? 'nextjs-tailwind' : hasStyled ? 'nextjs-styled' : 'nextjs-css';
+  if (paths.some(p => p.endsWith('.vue'))) return 'vue';
+  if (paths.some(p => p.endsWith('.svelte'))) return 'svelte';
+  if (hasTailwind) return 'react-tailwind';
+  if (hasBootstrap) return 'react-bootstrap';
+  return 'css';
+}
+
+/* ─── File selection — scoring approach (mirrors fixController.selectFilesToFetch) ── */
+function selectFilesForDesignFix(tree, framework) {
+  const SKIP = /(node_modules|\.git|\.next|dist|build|out|__pycache__|\.cache)\//i;
+  const SOURCE_EXT = /\.(jsx?|tsx?|html?|vue|svelte|css|scss|sass|less)$/i;
+  const blobs = tree
+    .filter(f => f.type === 'blob' && SOURCE_EXT.test(f.path) && !SKIP.test(f.path))
+    .map(f => ({ path: f.path, size: f.size }));
+
+  const scored = blobs.map(f => {
+    let score = 0;
+    const p = f.path.toLowerCase();
+
+    // Component / page files — highest relevance
+    if (p.includes('component')) score += 20;
+    if (p.includes('page'))      score += 18;
+    if (p.includes('layout'))    score += 18;
+    if (p.includes('header') || p.includes('nav') || p.includes('footer')) score += 15;
+    if (p.includes('hero') || p.includes('banner') || p.includes('section')) score += 12;
+    if (p.includes('card') || p.includes('button') || p.includes('sidebar')) score += 10;
+    if (p.includes('form') || p.includes('input') || p.includes('modal'))  score += 8;
+    if (p.includes('home') || p.includes('landing') || p.includes('main')) score += 15;
+    if (p.includes('app'))       score += 10;
+    if (p.includes('index'))     score += 8;
+
+    // Style files — always relevant for design fixes
+    if (p.endsWith('.css') || p.endsWith('.scss') || p.endsWith('.sass') || p.endsWith('.less')) score += 20;
+    if (p.includes('global') || p.includes('style') || p.includes('theme')) score += 18;
+    if (p.includes('variable') || p.includes('_var'))  score += 12;
+    if (p.includes('tailwind.config'))                 score += 25;
+    if (p.includes('module.css') || p.includes('module.scss')) score += 15;
+
+    // Extension bonuses
+    if (p.endsWith('.tsx') || p.endsWith('.jsx')) score += 10;
+    if (p.endsWith('.vue') || p.endsWith('.svelte')) score += 10;
+
+    // Penalize test/story files
+    if (p.includes('.test.') || p.includes('.spec.') || p.includes('.stories.')) score -= 40;
+    if (p.includes('__test') || p.includes('__mock')) score -= 40;
+
+    // Prefer smaller files (faster to process, fit in token window)
+    if (f.size && f.size < 15000) score += 5;
+    if (f.size && f.size > 80000) score -= 10;
+
+    return { ...f, score };
+  });
+
+  return scored
+    .filter(f => f.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 40) // match fixController's limit
+    .map(f => f.path);
+}
+
+/* ─── Diff generator ─────────────────────────────────────────────────────── */
+function generateDesignDiff(original, fixed, filePath) {
+  if (original === fixed) return '';
+  const origLines = original.split('\n'), fixedLines = fixed.split('\n');
+  const diff = [`--- a/${filePath}`, `+++ b/${filePath}`];
+  let i = 0, j = 0;
+  while (i < origLines.length || j < fixedLines.length) {
+    if (origLines[i] === fixedLines[j]) { diff.push(` ${origLines[i]}`); i++; j++; }
+    else {
+      if (i < origLines.length) diff.push(`-${origLines[i++]}`);
+      if (j < fixedLines.length) diff.push(`+${fixedLines[j++]}`);
+    }
+  }
+  return diff.join('\n');
+}
+
+/* ─── Fuzzy replace (from fixController) ─────────────────────────────────── */
+function fuzzyReplace(fileContent, originalCode, fixedCode) {
+  if (fileContent.includes(originalCode)) return fileContent.replace(originalCode, fixedCode);
+  const origLines = originalCode.split('\n').map(l => l.trim()).filter(l => l);
+  if (!origLines.length) return fileContent;
+  const lines = fileContent.split('\n');
+  for (let i = 0; i <= lines.length - origLines.length; i++) {
+    const slice = lines.slice(i, i + origLines.length).map(l => l.trim()).filter(l => l);
+    if (slice.join('\n') === origLines.join('\n')) {
+      const indent = lines[i].match(/^(\s*)/)[1];
+      const fixedLines = fixedCode.split('\n').map((l, idx) => idx === 0 ? l : indent + l.trim());
+      return [...lines.slice(0, i), ...fixedLines, ...lines.slice(i + origLines.length)].join('\n');
+    }
+  }
+  return fileContent;
+}
+
+const MAX_FULL_FILE = 40000; // chars — match sourceMapper limit
+
+const FRAMEWORK_HINTS = {
+  'nextjs-tailwind':  'Next.js + Tailwind CSS. Fix via tailwind.config.js theme values, globals.css, or updating className strings in .tsx/.jsx files.',
+  'react-tailwind':   'React + Tailwind CSS. Fix via tailwind.config.js theme values or className strings in JSX.',
+  'nextjs-styled':    'Next.js + styled-components/emotion. Fix the styled component definitions.',
+  'nextjs-css':       'Next.js + CSS Modules. Fix .module.css files and globals.css.',
+  'vue':              'Vue.js project. Fix <style> sections of .vue SFCs or separate CSS files.',
+  'svelte':           'Svelte project. Fix <style> sections of .svelte files.',
+  'react-bootstrap':  'React + Bootstrap. Fix SCSS variable overrides (_variables.scss).',
+  'css':              'Plain CSS/SCSS project. Fix CSS/SCSS files directly.',
+};
+
+/* ─── Per-mismatch: find best candidate file ─────────────────────────────── */
+function findBestFileForMismatch(mismatch, repoFiles) {
+  const loc = (mismatch.location || '').toLowerCase();
+  const cat = (mismatch.category || '').toLowerCase();
+  const desc = (mismatch.description || '').toLowerCase();
+  const figVal = (mismatch.figmaValue || '').toLowerCase();
+
+  const candidates = repoFiles.map(f => {
+    const p = f.filePath.toLowerCase();
+    const c = f.content.toLowerCase();
+    let score = 0;
+
+    // Category-based: style issues → CSS/SCSS, content → JSX/HTML
+    if (['colors', 'typography', 'spacing', 'borders', 'shadows'].includes(cat)) {
+      if (p.endsWith('.css') || p.endsWith('.scss') || p.includes('global') || p.includes('style')) score += 15;
+      if (p.includes('tailwind.config')) score += 10;
+    }
+    if (cat === 'content') {
+      if (p.endsWith('.tsx') || p.endsWith('.jsx') || p.endsWith('.html') || p.endsWith('.vue')) score += 15;
+    }
+
+    // Location-based matching (e.g., "Header", "Hero", "Footer")
+    const locWords = loc.replace(/[^a-zA-Z]/g, ' ').split(' ').filter(w => w.length > 2);
+    for (const w of locWords) {
+      if (p.includes(w)) score += 20;
+      if (c.includes(w)) score += 5;
+    }
+
+    // If figmaValue contains a color hex, check if the file has it or similar
+    if (figVal && figVal.startsWith('#')) {
+      if (c.includes(figVal)) score += 10;
+    }
+
+    // Content text match for content issues
+    if (cat === 'content' && mismatch.liveValue) {
+      const live = mismatch.liveValue.replace(/^"|"$/g, '').slice(0, 40);
+      if (live.length > 5 && c.includes(live.toLowerCase())) score += 25;
+    }
+
+    return { filePath: f.filePath, score };
+  });
+
+  return candidates.filter(c => c.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
+}
+
+/* ─── Per-mismatch Gemini fix call ───────────────────────────────────────── */
+async function geminiFixDesignMismatch(mismatch, fileData, framework, websiteUrl, model) {
+  const { filePath, content } = fileData;
+  const isLarge = content.length > MAX_FULL_FILE;
+  const frameworkHint = FRAMEWORK_HINTS[framework] || 'Fix the relevant files.';
+
+  const mismatchDesc = `Category: ${mismatch.category}
+Severity: ${mismatch.severity}
+Description: ${mismatch.description}
+Location: ${mismatch.location || 'N/A'}
+Figma value: ${mismatch.figmaValue || 'N/A'}
+Live site value: ${mismatch.liveValue || 'N/A'}`;
+
+  let prompt;
+  if (!isLarge) {
+    prompt = `You are a senior frontend engineer fixing a design mismatch.
+
+Framework: ${frameworkHint}
+Live site: ${websiteUrl}
+
+DESIGN MISMATCH:
+${mismatchDesc}
+
+SOURCE FILE: ${filePath}
+\`\`\`
+${content}
+\`\`\`
+
+TASK:
+1. Fix this specific design mismatch in the file above.
+2. For style issues: fix colors, fonts, spacing, border-radius, shadows, sizing.
+3. For Tailwind: update className strings or tailwind.config theme values.
+4. For Content mismatches: update hard-coded static text to match Figma. Only change truly static text.
+5. Make ONLY the minimal changes needed. Do NOT refactor or change anything else.
+6. Return the COMPLETE file with your fix applied.
+
+Respond ONLY with this JSON (no markdown, no text outside JSON):
+{
+  "bestFile": "${filePath}",
+  "confidence": 0-100,
+  "fullFixedContent": "COMPLETE FIXED FILE CONTENT — all lines",
+  "changeDescription": "one-line summary of what changed"
+}`;
+  } else {
+    // Snippet approach for large files
+    const lines = content.split('\n');
+    const searchTerms = (mismatch.location || '').replace(/[^a-zA-Z]/g, ' ').split(' ').filter(w => w.length > 3);
+    let focusLine = 0;
+    for (let i = 0; i < lines.length; i++) {
+      if (searchTerms.some(t => lines[i].toLowerCase().includes(t.toLowerCase()))) { focusLine = i; break; }
+    }
+    const start = Math.max(0, focusLine - 80);
+    const end = Math.min(lines.length, focusLine + 120);
+    const snippet = lines.slice(start, end).join('\n');
+
+    prompt = `You are a senior frontend engineer fixing a design mismatch.
+
+Framework: ${frameworkHint}
+
+DESIGN MISMATCH:
+${mismatchDesc}
+
+FILE: ${filePath} (large file — showing lines ${start + 1}–${end} of ${lines.length})
+\`\`\`
+${snippet}
+\`\`\`
+
+Fix this mismatch. Return ONLY this JSON:
+{
+  "bestFile": "${filePath}",
+  "confidence": 0-100,
+  "originalCode": "exact lines to replace (copy verbatim)",
+  "fixedCode": "the replacement lines",
+  "changeDescription": "one-line summary"
+}`;
   }
 
   try {
-    const { Octokit } = require('@octokit/rest');
-    const octokit = new Octokit({ auth: req.user?.githubToken });
-    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-    const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
+    const result = await model.generateContent(prompt);
+    const text = result.response.text().trim().replace(/^```json\s*/i, '').replace(/\s*```\s*$/, '');
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    return JSON.parse(jsonMatch[0]);
+  } catch (err) {
+    console.warn(`[DesignFix] Gemini call failed for ${filePath}:`, err.message);
+    return null;
+  }
+}
 
+/* ─── Main handler ───────────────────────────────────────────────────────── */
+const generateDesignFix = async (req, res) => {
+  const { mismatches, websiteUrl, repoFullName } = req.body;
+  if (!mismatches?.length || !repoFullName)
+    return res.status(400).json({ success: false, message: 'mismatches and repoFullName are required.' });
+
+  try {
+    const uid = req.user?.uid;
+    const octokit = await getUserOctokit(uid);
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
     const [owner, repo] = repoFullName.split('/');
 
-    // Fetch repo tree to find CSS/style files
-    const { data: treeData } = await octokit.git.getTree({
-      owner, repo, tree_sha: 'HEAD', recursive: '1',
-    });
+    // ── Step 1: Get repo tree + detect framework ────────────────────────────
+    const { data: repoMeta } = await octokit.rest.repos.get({ owner, repo });
+    const branch = repoMeta.default_branch;
+    const { data: treeData } = await octokit.rest.git.getTree({ owner, repo, tree_sha: branch, recursive: 'true' });
 
-    const styleFiles = treeData.tree
-      .filter(f => f.type === 'blob' && /\.(css|scss|less|sass|module\.css|styled\.(ts|tsx|js))$/i.test(f.path))
-      .slice(0, 20); // cap to avoid rate limits
+    let pkgJson = null;
+    try {
+      const { data: pkg } = await octokit.rest.repos.getContent({ owner, repo, path: 'package.json' });
+      pkgJson = JSON.parse(Buffer.from(pkg.content, 'base64').toString('utf-8'));
+    } catch { /* optional */ }
 
-    // Fetch content of each style file
-    const fileContents = await Promise.all(styleFiles.map(async (file) => {
-      try {
-        const { data } = await octokit.repos.getContent({ owner, repo, path: file.path });
-        const content = Buffer.from(data.content, 'base64').toString('utf-8');
-        return { path: file.path, content: content.slice(0, 8000) }; // cap size
-      } catch { return null; }
+    const framework = detectFrameworkFromTree(treeData.tree, pkgJson);
+    console.log(`[DesignFix] Framework: ${framework}, Repo: ${repoFullName}`);
+
+    // ── Step 2: Select and fetch files (scoring approach, up to 40) ─────────
+    const filePaths = selectFilesForDesignFix(treeData.tree, framework);
+    if (!filePaths.length) return res.status(400).json({ success: false, message: 'No relevant source files found.' });
+    console.log(`[DesignFix] Selected ${filePaths.length} files to fetch`);
+
+    const fetched = await Promise.allSettled(filePaths.map(async path => {
+      const { data } = await octokit.rest.repos.getContent({ owner, repo, path, ref: branch });
+      return { filePath: path, content: Buffer.from(data.content, 'base64').toString('utf-8') };
     }));
+    const repoFiles = fetched.filter(r => r.status === 'fulfilled').map(r => r.value);
+    if (!repoFiles.length) return res.status(400).json({ success: false, message: 'Could not fetch any source files.' });
+    console.log(`[DesignFix] Fetched ${repoFiles.length} files`);
 
-    const validFiles = fileContents.filter(Boolean);
+    // ── Step 3: Per-mismatch processing (batches of 3, like sourceMapper) ───
+    const fileFixMap = new Map(); // filePath → { content, fixedContent, changes[] }
+    const CONCURRENCY = 3;
+    const toProcess = mismatches.slice(0, 20); // cap at 20 mismatches
 
-    // Build Gemini prompt
-    const mismatchSummary = mismatches
-      .slice(0, 15)
-      .map((m, i) => `${i + 1}. [${m.category || 'style'}] ${m.description || m.issue || JSON.stringify(m)}`)
-      .join('\n');
+    for (let i = 0; i < toProcess.length; i += CONCURRENCY) {
+      const batch = toProcess.slice(i, i + CONCURRENCY);
+      const results = await Promise.all(batch.map(async (mismatch) => {
+        // Find best candidate file(s)
+        const candidates = findBestFileForMismatch(mismatch, repoFiles);
+        if (!candidates.length) {
+          // Fallback: send file listing to Gemini to pick
+          console.log(`[DesignFix] No candidate for "${mismatch.category}: ${mismatch.description?.slice(0, 40)}" — trying all files`);
+          // Pick first style file or first component file
+          const fallback = repoFiles.find(f =>
+            /\.(css|scss)$/i.test(f.filePath) || /global/i.test(f.filePath)
+          ) || repoFiles[0];
+          if (!fallback) return null;
+          return geminiFixDesignMismatch(mismatch, fallback, framework, websiteUrl, model);
+        }
 
-    const filesContext = validFiles
-      .map(f => `### FILE: ${f.path}\n\`\`\`css\n${f.content}\n\`\`\``)
-      .join('\n\n');
+        const bestPath = candidates[0].filePath;
+        const fileData = repoFiles.find(f => f.filePath === bestPath);
+        if (!fileData) return null;
+        return geminiFixDesignMismatch(mismatch, fileData, framework, websiteUrl, model);
+      }));
 
-    const prompt = `You are an expert frontend engineer. 
-A visual comparison between a live website (${websiteUrl}) and its Figma design found these mismatches:
+      // Accumulate results into fileFixMap
+      for (let j = 0; j < results.length; j++) {
+        const gemResult = results[j];
+        if (!gemResult || !gemResult.bestFile) continue;
 
-${mismatchSummary}
+        const filePath = gemResult.bestFile;
+        const repoFile = repoFiles.find(f => f.filePath === filePath);
+        if (!repoFile) continue;
 
-Here are the project's style files:
-${filesContext}
+        if (!fileFixMap.has(filePath)) {
+          fileFixMap.set(filePath, {
+            filePath,
+            content: repoFile.content,
+            fixedContent: repoFile.content,
+            confidence: gemResult.confidence || 70,
+            changes: [],
+          });
+        }
+        const entry = fileFixMap.get(filePath);
 
-For each mismatch you can fix in a style file, output a JSON array of fix objects:
-[
-  {
-    "filePath": "path/to/file.css",
-    "changes": [
-      {
-        "original": "exact CSS selector or rule to replace",
-        "fixed": "the corrected CSS",
-        "reason": "brief explanation"
+        // Full-file replacement (preferred, for small files)
+        if (gemResult.fullFixedContent && gemResult.fullFixedContent.trim().length > 50) {
+          entry.fixedContent = gemResult.fullFixedContent;
+          entry.changes.push({
+            original: '[design fix applied]',
+            fixed: '[design fix applied]',
+            reason: gemResult.changeDescription || batch[j]?.description || 'Design mismatch fix',
+          });
+          entry.confidence = Math.max(entry.confidence, gemResult.confidence || 70);
+          console.log(`[DesignFix] Full-file fix for ${filePath}`);
+        }
+        // Snippet replacement (for large files)
+        else if (gemResult.originalCode && gemResult.fixedCode) {
+          const before = entry.fixedContent;
+          entry.fixedContent = fuzzyReplace(entry.fixedContent, gemResult.originalCode, gemResult.fixedCode);
+          if (entry.fixedContent !== before) {
+            console.log(`[DesignFix] Snippet fix for ${filePath}`);
+          }
+          entry.changes.push({
+            original: gemResult.originalCode,
+            fixed: gemResult.fixedCode,
+            reason: gemResult.changeDescription || 'Design mismatch fix',
+          });
+        }
       }
-    ],
-    "confidence": 75
-  }
-]
+    }
 
-Rules:
-- Only include files from the list above
-- Only fix actual style mismatches (colors, fonts, spacing, sizing)
-- Keep changes minimal and targeted
-- confidence = 0–100 based on how certain you are
-- Output ONLY the JSON array, no markdown wrapper`;
+    // ── Step 4: Build final mapped files with diffs ─────────────────────────
+    const mappedFiles = [...fileFixMap.values()]
+      .filter(f => f.fixedContent !== f.content)
+      .map(f => ({
+        filePath: f.filePath,
+        confidence: f.confidence,
+        changes: f.changes,
+        originalContent: f.content,
+        fixedContent: f.fixedContent,
+        diff: generateDesignDiff(f.content, f.fixedContent, f.filePath),
+      }));
 
-    const result = await model.generateContent(prompt);
-    const raw = result.response.text();
-    const jsonMatch = raw.match(/\[\s*\{[\s\S]*\}\s*\]/);
-    if (!jsonMatch) throw new Error('Gemini returned no parseable fix JSON');
-    const mappedFiles = JSON.parse(jsonMatch[0]);
+    if (!mappedFiles.length)
+      return res.status(422).json({ success: false, message: 'AI found no actionable changes in the repository files.' });
 
-    // Persist as FixSession
+    // ── Step 5: Persist session ─────────────────────────────────────────────
     const session = await FixSession.create({
-      userId: req.user?.uid,
-      scanId: null,
-      repoFullName,
-      fixType: 'design',
-      websiteUrl,
-      mappedFiles,
-      unmappedErrors: mismatches.filter(m =>
-        !mappedFiles.some(f => f.changes?.some(c => c.reason?.toLowerCase().includes(m.category?.toLowerCase())))
-      ),
-      status: 'pending',
-      framework: 'css',
+      userId: uid, scanId: null, repoFullName, fixType: 'design',
+      websiteUrl, framework, mappedFiles, unmappedErrors: [],
+      status: 'review',
+      totalFilesChanged: mappedFiles.length,
+      totalFixesApplied: mappedFiles.reduce((s, f) => s + (f.changes?.length || 0), 0),
     });
+    console.log(`[DesignFix] Done. Framework=${framework}, Files=${mappedFiles.length}, Fixes=${mappedFiles.reduce((s, f) => s + f.changes.length, 0)}`);
 
     return res.json({
       success: true,
       sessionId: session._id,
-      mappedFiles,
+      framework,
+      mappedFiles: mappedFiles.map(f => ({
+        filePath: f.filePath, confidence: f.confidence, changes: f.changes,
+        diff: f.diff, originalContent: f.originalContent, fixedContent: f.fixedContent,
+      })),
       unmappedErrors: [],
       totalMismatches: mismatches.length,
       fixedMismatches: mappedFiles.reduce((s, f) => s + (f.changes?.length || 0), 0),
@@ -629,4 +1164,5 @@ Rules:
   }
 };
 
-module.exports = { matchDesign, generateDesignFix };
+module.exports = { matchDesign, generateDesignFix, getDesignHistory, getDesignScan, deleteDesignScan };
+

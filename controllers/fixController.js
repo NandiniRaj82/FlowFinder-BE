@@ -134,6 +134,8 @@ const generateFixes = async (req, res) => {
             changesCount: f.changes.length,
             diff: f.diff,
             changes: f.changes,
+            originalContent: f.content,
+            fixedContent: f.fixedContent,
           })),
           unmappedErrors: [],
         });
@@ -195,7 +197,7 @@ const generateFixes = async (req, res) => {
     const fileFixMap = new Map(); // filePath → { originalContent, fixes[] }
 
     for (const mapped of mappedErrors) {
-      if (!mapped.bestFile || !mapped.fixedCode) continue;
+      if (!mapped.bestFile) continue;
       const repoFile = repoFiles.find(f => f.filePath === mapped.bestFile);
       if (!repoFile) continue;
 
@@ -210,11 +212,28 @@ const generateFixes = async (req, res) => {
       }
 
       const entry = fileFixMap.get(mapped.bestFile);
-      // Apply the fix using fuzzy replace (handles whitespace/indentation mismatches)
+
+      // ── Primary path: Gemini returned the complete fixed file ──────────────
+      if (mapped.fullFixedContent && mapped.fullFixedContent.trim().length > 50) {
+        const prevLength = entry.fixedContent.length;
+        entry.fixedContent = mapped.fullFixedContent;
+        console.log(`[FixController] Full-file fix applied for ${mapped.bestFile} (${prevLength} → ${entry.fixedContent.length} chars)`);
+        entry.changes.push({
+          original: '[full file replacement]',
+          fixed: '[full file replacement]',
+          reason: mapped.explanation || mapped.changeDescription || mapped.error?.message || 'Accessibility fix',
+        });
+        entry.confidence = Math.max(entry.confidence, mapped.confidence || 70);
+        continue;
+      }
+
+      // ── Fallback: snippet approach (large files) ───────────────────────────
       if (mapped.originalCode && mapped.fixedCode) {
         const before = entry.fixedContent;
         entry.fixedContent = fuzzyReplace(entry.fixedContent, mapped.originalCode, mapped.fixedCode);
-        if (entry.fixedContent === before) {
+        if (entry.fixedContent !== before) {
+          console.log(`[FixController] Snippet fuzzyReplace succeeded for ${mapped.bestFile}`);
+        } else {
           console.warn(`[FixController] fuzzyReplace had no effect for ${mapped.bestFile}`);
           console.warn('[FixController] originalCode snippet:', JSON.stringify(mapped.originalCode.slice(0, 80)));
         }
@@ -224,8 +243,6 @@ const generateFixes = async (req, res) => {
           reason: mapped.explanation || mapped.error?.message || 'Accessibility fix',
         });
       }
-
-
     }
 
     const mappedFiles = [...fileFixMap.values()].map(f => ({
@@ -240,7 +257,7 @@ const generateFixes = async (req, res) => {
       framework,
       repoDefaultBranch: branch,
       totalFilesChanged: mappedFiles.length,
-      totalFixesApplied: mappedErrors.filter(m => m.bestFile && m.fixedCode).length,
+      totalFixesApplied: mappedErrors.filter(m => m.bestFile && (m.fullFixedContent || m.fixedCode)).length,
     });
 
     return res.json({
@@ -257,6 +274,8 @@ const generateFixes = async (req, res) => {
         changesCount: f.changes.length,
         diff: f.diff,
         changes: f.changes,
+        originalContent: f.content,     // full original file for Monaco diff
+        fixedContent: f.fixedContent,   // full fixed file for Monaco diff
       })),
       unmappedErrors: mappedErrors
         .filter(m => !m.bestFile)
@@ -297,25 +316,54 @@ const createFixPR = async (req, res) => {
 
     // Build file list from accepted files.
     // Match by full path OR by basename (in case frontend sends basename only).
-    const filesToCommit = session.mappedFiles
-      .filter(f => {
-        if (!acceptedFiles || acceptedFiles.length === 0) return true;
-        const basename = f.filePath.split('/').pop();
-        return acceptedFiles.includes(f.filePath) || acceptedFiles.includes(basename);
-      })
-      .filter(f => f.fixedContent)
+    // CRITICAL: only commit files where fixedContent actually differs from original content.
+    // Files where fixedContent === content had fuzzyReplace fail — attempt a second-pass fix.
+    const candidateFiles = session.mappedFiles.filter(f => {
+      if (!acceptedFiles || acceptedFiles.length === 0) return true;
+      const basename = f.filePath.split('/').pop();
+      return acceptedFiles.includes(f.filePath) || acceptedFiles.includes(basename);
+    });
+
+    // Second-pass: for files where fixedContent === content, try applying changes individually
+    for (const f of candidateFiles) {
+      if (f.fixedContent && f.fixedContent === f.content && f.changes?.length > 0) {
+        console.log(`[createFixPR] Second-pass fuzzyReplace for ${f.filePath} (${f.changes.length} changes)`);
+        let rebuilt = f.content;
+        for (const ch of f.changes) {
+          if (ch.original && ch.fixed) {
+            rebuilt = fuzzyReplace(rebuilt, ch.original, ch.fixed);
+          }
+        }
+        if (rebuilt !== f.content) {
+          f.fixedContent = rebuilt; // mutate in-memory; also persist below
+          await FixSession.updateOne(
+            { _id: session._id, 'mappedFiles.filePath': f.filePath },
+            { $set: { 'mappedFiles.$.fixedContent': rebuilt } }
+          );
+          console.log(`[createFixPR] Second-pass succeeded for ${f.filePath}`);
+        }
+      }
+    }
+
+    const filesToCommit = candidateFiles
+      .filter(f => f.fixedContent && f.fixedContent !== f.content)
       .map(f => ({ path: f.filePath, content: f.fixedContent }));
 
     console.log('[createFixPR] filesToCommit:', filesToCommit.map(f => f.path));
+    console.log('[createFixPR] skipped (no actual change):', candidateFiles
+      .filter(f => !f.fixedContent || f.fixedContent === f.content)
+      .map(f => f.filePath));
 
     if (!filesToCommit.length) {
-      const debugInfo = session.mappedFiles.map(f => ({
+      const debugInfo = candidateFiles.map(f => ({
         path: f.filePath,
         hasFixed: !!f.fixedContent,
+        hasActualChange: f.fixedContent !== f.content,
+        changesCount: f.changes?.length ?? 0,
       }));
       return res.status(400).json({
         success: false,
-        message: 'No files with generated fixes found.',
+        message: 'No files with actual code changes found. The AI-generated fixes may not have matched the exact code in your repository. Try running "Generate Fixes" again with forceRefresh.',
         debug: { acceptedFiles, sessionFiles: debugInfo },
       });
     }
@@ -400,6 +448,25 @@ const getFixSession = async (req, res) => {
   }
 };
 
+/**
+ * GET /api/fixes/by-scan/:scanId
+ * List all fix sessions for a given scan (for fix history UI)
+ */
+const listFixSessionsByScan = async (req, res) => {
+  try {
+    const sessions = await FixSession.find({
+      userId: req.user.uid,
+      scanId: req.params.scanId,
+    })
+      .sort({ createdAt: -1 })
+      .select('_id status repoFullName totalFilesChanged totalFixesApplied prUrl prNumber branchName createdAt framework');
+
+    res.json({ success: true, sessions });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+};
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function generateDiff(original, fixed, filePath) {
   if (original === fixed) return '';
@@ -441,4 +508,4 @@ ${files.map(f => `- \`${f.path}\``).join('\n')}
 *Review each file carefully before merging. All fixes are minimal and targeted.*`;
 }
 
-module.exports = { generateFixes, createFixPR, getFixSession };
+module.exports = { generateFixes, createFixPR, getFixSession, listFixSessionsByScan };
