@@ -19,7 +19,6 @@ const githubRoutes = require('./router/github');
 const scanRoutes = require('./router/scans');
 const fixRoutes = require('./router/fixes');
 const lighthouseRoutes = require('./router/lighthouse');
-const dashboardRoutes = require('./router/dashboard');
 
 // Create uploads directory if it doesn't exist
 const uploadsDir = path.join(__dirname, 'uploads');
@@ -93,8 +92,6 @@ app.use('/api/github', githubRoutes);
 app.use('/api/scans', scanRoutes);
 app.use('/api/fixes', fixRoutes);
 app.use('/api/lighthouse', lighthouseRoutes);
-app.use('/api/dashboard', dashboardRoutes);
-app.use('/api/users', require('./router/user'));
 
 // Health check
 app.get('/api/health', (req, res) => {
