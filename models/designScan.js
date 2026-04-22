@@ -18,6 +18,9 @@ const MismatchSchema = new mongoose.Schema({
     x: Number, y: Number,
     width: Number, height: Number,
   },
+  property: String,
+  delta: Number,
+  matchConfidence: Number,
 }, { _id: false });
 
 const DesignScanSchema = new mongoose.Schema({
