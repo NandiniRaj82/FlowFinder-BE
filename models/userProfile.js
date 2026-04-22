@@ -28,6 +28,12 @@ const UserProfileSchema = new mongoose.Schema({
     connectedAt: Date,
   },
 
+  // Figma personal access token (user-provided)
+  figma: {
+    accessToken: String,       // personal access token from figma.com/settings
+    connectedAt: Date,
+  },
+
   // Preferences
   preferences: {
     darkMode: { type: Boolean, default: false },
