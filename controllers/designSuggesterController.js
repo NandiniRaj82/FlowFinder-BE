@@ -3,45 +3,87 @@ const puppeteer = require('puppeteer');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
+// ── Resilient navigation helper ───────────────────────────────────────────
+// Strategy: try domcontentloaded (fast), fall back to load, then just wait.
+// Never throws — always returns after the page has at least started rendering.
+async function navigateSafe(page, url) {
+  const strategies = [
+    { waitUntil: 'domcontentloaded', timeout: 30000 },
+    { waitUntil: 'load',             timeout: 45000 },
+    { waitUntil: 'domcontentloaded', timeout: 60000 },
+  ];
+
+  for (const s of strategies) {
+    try {
+      await page.goto(url, s);
+      return; // success
+    } catch (err) {
+      console.warn(`[Redesigner] Nav attempt failed (${s.waitUntil}/${s.timeout}ms): ${err.message}`);
+    }
+  }
+
+  // Last resort — navigate with no wait condition, then just pause
+  try {
+    await page.goto(url, { waitUntil: 'commit', timeout: 60000 });
+    await new Promise(r => setTimeout(r, 5000));
+  } catch (err) {
+    console.error('[Redesigner] All navigation strategies failed:', err.message);
+    // Don't throw — page may still have partial content we can scrape
+  }
+}
+
 // ── Full page screenshot ──────────────────────────────────────────────────
 async function screenshotWebsite(url) {
   let browser;
   try {
-    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
     const page = await browser.newPage();
     await page.setViewport({ width: 1440, height: 900 });
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 40000 });
-    await new Promise(r => setTimeout(r, 4000));
-    await autoScroll(page);
+    // Real browser UA to bypass basic bot-detection
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+
+    await navigateSafe(page, url);
+
+    // Short settle wait — enough for hero images/fonts to paint
     await new Promise(r => setTimeout(r, 2000));
+
     const screenshot = await page.screenshot({ type: 'jpeg', quality: 80, fullPage: false });
     return screenshot.toString('base64');
-  } finally { if (browser) await browser.close(); }
-}
-
-async function autoScroll(page) {
-  await page.evaluate(async () => {
-    await new Promise(resolve => {
-      let total = 0;
-      const timer = setInterval(() => {
-        window.scrollBy(0, 200);
-        total += 200;
-        if (total >= document.body.scrollHeight) { clearInterval(timer); window.scrollTo(0, 0); resolve(); }
-      }, 60);
-    });
-  });
+  } catch (err) {
+    console.error('[Redesigner] Screenshot failed:', err.message);
+    return ''; // non-fatal — UI handles empty screenshot gracefully
+  } finally {
+    if (browser) await browser.close();
+  }
 }
 
 // ── Deep content scrape — gets EVERYTHING ────────────────────────────────
 async function scrapePageContent(url) {
   let browser;
   try {
-    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+    });
     const page = await browser.newPage();
     await page.setViewport({ width: 1440, height: 900 });
-    await page.goto(url, { waitUntil: 'networkidle0', timeout: 40000 });
-    await new Promise(r => setTimeout(r, 4000));
-    await autoScroll(page);
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36');
+
+    // Block heavy resources that slow page load but aren't needed for text scraping
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const type = req.resourceType();
+      if (['image', 'media', 'font', 'websocket'].includes(type)) {
+        req.abort();
+      } else {
+        req.continue();
+      }
+    });
+
+    await navigateSafe(page, url);
     await new Promise(r => setTimeout(r, 2000));
 
     const content = await page.evaluate(() => {
@@ -215,7 +257,7 @@ function buildContentReference(content, url) {
   return lines.join('\n');
 }
 
-// ── Generate HTML (framework=html) ────────────────────────────────────────
+// ── Generate design code (branches on framework) ────────────────────────
 async function generateHTML(content, style, url, customPrompt, framework) {
   const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
   const contentRef = buildContentReference(content, url);
@@ -224,159 +266,177 @@ async function generateHTML(content, style, url, customPrompt, framework) {
     minimal: { name: 'Minimal & Clean', guide: 'White background, near-black text, single blue accent (#2563EB), generous whitespace, DM Sans or Plus Jakarta Sans from Google Fonts, no gradients, subtle animations, thin borders.' },
     bold: { name: 'Bold & Dark', guide: 'Very dark background (#0A0A0F), white text, electric blue or neon accent, Syne or Space Grotesk from Google Fonts, glow effects, gradient hero text, high contrast cards, slide-in animations.' },
     colorful: { name: 'Colorful & Vibrant', guide: 'Warm gradient backgrounds, Nunito or Poppins from Google Fonts, rounded corners (20px+), multiple accent colors, colorful cards, bouncy hover effects, energetic startup feel.' },
-    custom: { name: 'Custom Design', guide: customPrompt || 'Modern clean design.' },
-    custom_1: { name: 'Custom Style 1', guide: customPrompt || 'Modern clean design.' },
-    custom_2: { name: 'Custom Style 2', guide: customPrompt || 'Modern clean design.' },
-    custom_3: { name: 'Custom Style 3', guide: customPrompt || 'Modern clean design.' },
+    custom:   { name: 'Custom Design',   guide: customPrompt || 'Modern clean design.' },
+    custom_1: { name: 'Custom Style 1',  guide: customPrompt || 'Modern clean design.' },
+    custom_2: { name: 'Custom Style 2',  guide: customPrompt || 'Modern clean design.' },
+    custom_3: { name: 'Custom Style 3',  guide: customPrompt || 'Modern clean design.' },
   };
 
   const sg = styleGuides[style] || styleGuides.minimal;
-  // For any custom_N key always inject the actual prompt so it overrides the placeholder
   if (style.startsWith('custom') && customPrompt) {
     sg.guide = customPrompt;
-    sg.name = style === 'custom' ? 'Custom Design'
-      : `Custom Style ${style.replace('custom_', '')}`;
+    sg.name = style === 'custom' ? 'Custom Design' : 'Custom Style ' + style.replace('custom_', '');
   }
 
-  const frameworkInstructions = {
-    html: {
-      ext: 'html',
-      label: 'HTML/CSS/JS',
-      instruction: `Return a single complete HTML file with all CSS in a <style> tag and all JS in a <script> tag. No external CSS frameworks. Include Google Fonts <link> in <head>. Start with <!DOCTYPE html>.`,
-    },
-    react: {
-      ext: 'jsx',
-      label: 'React (JSX)',
-      instruction: `Return a single React component file. Use inline styles or a <style> tag via a useEffect. Import React at top. Export default App component. Use useState/useEffect where needed. No external CSS imports. Include Google Fonts via a <link> injected in useEffect. All content in one file.`,
-    },
-    nextjs: {
-      ext: 'jsx',
-      label: 'Next.js',
-      instruction: `Return a Next.js page component. Use 'use client' at top. Import Head from next/head for Google Fonts. Export default function Page(). Use React hooks where needed. All styles in a <style jsx> tag or inline styles. Single file with all content.`,
-    },
-    angular: {
-      ext: 'ts',
-      label: 'Angular',
-      instruction: `Return a single Angular standalone component file. Use @Component decorator with template and styles inline. Import CommonModule. Export the component as default. Use standalone: true. All content in the template string. Include Google Fonts in the styles array.`,
-    },
-    vue: {
-      ext: 'vue',
-      label: 'Vue.js',
-      instruction: `Return a single Vue 3 SFC (.vue file). Use <template>, <script setup>, and <style scoped> sections. Use Composition API. Include Google Fonts in a <link> injected via onMounted. All content in one file.`,
-    },
+  const frameworkMeta = {
+    html:    { ext: 'html', label: 'HTML/CSS/JS' },
+    react:   { ext: 'jsx',  label: 'React (JSX)' },
+    nextjs:  { ext: 'jsx',  label: 'Next.js' },
+    angular: { ext: 'ts',   label: 'Angular' },
+    vue:     { ext: 'vue',  label: 'Vue.js' },
   };
-
-  const fw = frameworkInstructions[framework] || frameworkInstructions.html;
-
-  const contentRules = `
-ABSOLUTE CONTENT RULES:
-1. INCLUDE EVERY SINGLE ITEM from the content reference below
-2. Copy ALL text VERBATIM — do not change a single word
-3. Include ALL ${content.allListItems.length} list items — not just some of them
-4. Include ALL ${content.badges.length} badges/tags/tech stack items — every single one
-5. Include ALL ${content.sections.length} sections — do not skip any section
-6. Include ALL ${content.paras.length} paragraphs
-7. Do NOT add Lorem ipsum or any invented text
-8. Do NOT remove ANY content
-9. Only change: colors, fonts, layout, spacing, animations — NEVER the text content
-
-${contentRef}
-
-TECHNICAL REQUIREMENTS:
-- Fully responsive with mobile breakpoints
-- Sticky navigation, smooth scroll
-- CSS animations: fade-in on load, scroll-reveal, hover effects
-- All sections present with ALL their content
-- For images: use CSS gradient placeholders — no broken img tags`;
+  const fw = frameworkMeta[framework] || frameworkMeta.html;
 
   const isCustomStyle = style === 'custom' || style.startsWith('custom_');
-  const styleBlock = `STYLE: ${sg.name}
-STYLE GUIDE: ${sg.guide}
-${isCustomStyle && customPrompt ? `USER CUSTOM INSTRUCTIONS: ${customPrompt}` : ''}`;
+  const styleBlock = 'STYLE: ' + sg.name + '\nSTYLE GUIDE: ' + sg.guide +
+    (isCustomStyle && customPrompt ? '\nUSER CUSTOM INSTRUCTIONS: ' + customPrompt : '');
 
-  const cleanCode = text => {
-    let t = text.trim();
+  const contentRules =
+    'ABSOLUTE CONTENT RULES:\n' +
+    '1. INCLUDE EVERY SINGLE ITEM from the content reference below\n' +
+    '2. Copy ALL text VERBATIM\n' +
+    '3. Include ALL ' + content.allListItems.length + ' list items\n' +
+    '4. Include ALL ' + content.badges.length + ' badges/tags/tech stack items\n' +
+    '5. Include ALL ' + content.sections.length + ' sections\n' +
+    '6. Include ALL ' + content.paras.length + ' paragraphs\n' +
+    '7. Do NOT add Lorem ipsum or invented text\n' +
+    '8. Only change: colors, fonts, layout, spacing, animations\n\n' +
+    contentRef +
+    '\nTECHNICAL REQUIREMENTS:\n' +
+    '- Fully responsive with mobile breakpoints\n' +
+    '- Sticky navigation, smooth scroll\n' +
+    '- CSS animations: fade-in on load, hover effects\n' +
+    '- For images: use CSS gradient placeholders';
+
+  const cleanCode = function(text) {
+    var t = text.trim();
     t = t.replace(/^```[\w]*\n?/gm, '').replace(/\n?```/gm, '').trim();
     return t;
   };
 
-  const isValidHtml = text => text.includes('<!DOCTYPE') || text.includes('<html');
+  const isValidHtml = function(text) {
+    return text.includes('<!DOCTYPE') || text.includes('<html');
+  };
 
-  // ── Generate plain HTML (used for both preview AND download) ─────────────
-  const htmlPrompt = `You are a frontend developer. Generate a complete HTML website redesign.
-
-CRITICAL OUTPUT FORMAT:
-- Start with exactly: <!DOCTYPE html>
-- Plain HTML/CSS/JS only — NO React, NO JSX, NO Vue, NO Angular
-- NO import or export statements
-- All CSS in a <style> tag in <head>
-- All JS in a <script> tag before </body>
-- Include Google Fonts via <link> in <head>
-
-CRITICAL CONTENT RULES:
-- Use the EXACT text values from the content reference below
-- Do NOT include any labels, brackets, numbers or markers in your HTML output
-- Do NOT write things like "[H1-1]", "(paragraph)", "[BTN7]", "[TAG1]" — these are instructions for you, not content
-- Output only the clean text: e.g. write "Nandini Raj" not "[H1-1] Nandini Raj"
-- Do NOT output any reference markers whatsoever in the final HTML
-
-${styleBlock}
-
-${contentRules}
-
-FINAL REMINDER: The HTML page must show clean readable text with NO labels, NO brackets, NO reference numbers.
-Start your response with: <!DOCTYPE html>`;
+  // ── STEP 1: Always generate plain HTML (for thumbnail preview card) ───────
+  const htmlPrompt =
+    'You are a frontend developer. Generate a complete HTML website redesign.\n\n' +
+    'CRITICAL OUTPUT FORMAT:\n' +
+    '- Start with exactly: <!DOCTYPE html>\n' +
+    '- Plain HTML/CSS/JS only — NO React, NO JSX, NO Vue, NO Angular\n' +
+    '- All CSS in a <style> tag in <head>\n' +
+    '- All JS in a <script> tag before </body>\n' +
+    '- Include Google Fonts via <link> in <head>\n\n' +
+    'CRITICAL CONTENT RULES:\n' +
+    '- Use the EXACT text values from the content reference below\n' +
+    '- Do NOT include any labels, brackets, numbers or markers in your HTML output\n' +
+    '- Output only clean text — no reference markers\n\n' +
+    styleBlock + '\n\n' +
+    contentRules + '\n\n' +
+    'Start your response with: <!DOCTYPE html>';
 
   console.log('[Redesigner] Generating HTML preview for style:', style);
-  let htmlResult = await model.generateContent(htmlPrompt);
-  let previewHtml = cleanCode(htmlResult.response.text());
+  var htmlResult = await model.generateContent(htmlPrompt);
+  var previewHtml = cleanCode(htmlResult.response.text());
 
-  // Extract from DOCTYPE if there's prefix text
-  const doctypeIdx = previewHtml.indexOf('<!DOCTYPE');
-  const htmlTagIdx = previewHtml.indexOf('<html');
-  const startIdx = doctypeIdx > -1 ? doctypeIdx : (htmlTagIdx > -1 ? htmlTagIdx : -1);
+  var doctypeIdx = previewHtml.indexOf('<!DOCTYPE');
+  var htmlTagIdx = previewHtml.indexOf('<html');
+  var startIdx = doctypeIdx > -1 ? doctypeIdx : (htmlTagIdx > -1 ? htmlTagIdx : -1);
   if (startIdx > 0) previewHtml = previewHtml.slice(startIdx);
 
-  // If still not valid HTML, retry once
   if (!isValidHtml(previewHtml)) {
     console.warn('[Redesigner] Invalid HTML, retrying...');
     htmlResult = await model.generateContent(htmlPrompt);
     previewHtml = cleanCode(htmlResult.response.text());
-    const idx2 = previewHtml.indexOf('<!DOCTYPE');
+    var idx2 = previewHtml.indexOf('<!DOCTYPE');
     if (idx2 > -1) previewHtml = previewHtml.slice(idx2);
   }
 
-  // Absolute fallback
   if (!isValidHtml(previewHtml)) {
-    previewHtml = `<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Preview</title><style>body{margin:0;font-family:sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:1rem;}</style></head><body><h2 style="color:#6366f1">Preview loading failed</h2><p style="opacity:0.5">Please try again</p></body></html>`;
+    previewHtml = '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Preview</title><style>body{margin:0;font-family:sans-serif;background:#0a0a0f;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:1rem;}</style></head><body><h2 style="color:#6366f1">Preview loading failed</h2><p style="opacity:0.5">Please try again</p></body></html>';
   }
 
   console.log('[Redesigner] HTML preview ready, length:', previewHtml.length);
 
-  // ── Framework code = HTML with a comment header explaining usage ──────────
-  // We skip live conversion to avoid timeouts. User downloads HTML and can
-  // copy-paste into their framework or use an online converter.
-  const frameworkNotes = {
-    html: '',
-    react: `/* To use in React:\n   1. Create a new .jsx file\n   2. Paste the HTML structure into JSX (convert class → className, style strings → objects)\n   3. Or use dangerouslySetInnerHTML to embed this HTML directly\n   4. Recommended: use https://transform.tools/html-to-jsx to convert automatically\n*/\n\n`,
-    nextjs: `/* To use in Next.js:\n   1. Create app/page.jsx or pages/index.jsx\n   2. Paste the HTML into a component with dangerouslySetInnerHTML\n   3. Or convert to JSX using https://transform.tools/html-to-jsx\n   4. Move <style> contents to a .module.css file\n*/\n\n`,
-    vue: `<!-- To use in Vue.js:\n  1. Create a .vue file\n  2. Paste HTML into <template>, CSS into <style scoped>\n  3. Or use this HTML directly via v-html directive\n  4. Recommended: https://transform.tools/ for conversion\n-->\n\n`,
-    angular: `/* To use in Angular:\n   1. Paste HTML into component template\n   2. Move CSS into component styles array\n   3. Replace class attributes (no changes needed for Angular)\n   4. Or use [innerHTML] binding to embed directly\n*/\n\n`,
+  // ── STEP 2: If HTML framework, return immediately ─────────────────────────
+  if (!framework || framework === 'html') {
+    return { style: style, styleName: sg.name, framework: 'html', frameworkLabel: fw.label, ext: 'html', code: previewHtml, previewHtml: previewHtml, previewType: 'html' };
+  }
+
+  // ── STEP 3: Generate real framework-specific code ─────────────────────────
+  var fwInstructions = {
+    react:
+      'You are a senior React developer. Generate a complete, beautiful single-file React component (JSX).\n\n' +
+      'CRITICAL FORMAT RULES:\n' +
+      '- First line MUST be: import React, { useState, useEffect } from "react";\n' +
+      '- Last line MUST be: export default App;\n' +
+      '- Function name: function App()\n' +
+      '- Use ONLY inline styles (style={{}}). NO className, NO external CSS files\n' +
+      '- Inject Google Fonts via useEffect adding a <link> element to document.head\n' +
+      '- Use useState/useEffect for any interactivity (nav toggle, etc.)\n' +
+      '- All content in one self-contained file runnable in CodeSandbox React template\n\n' +
+      styleBlock + '\n\n' + contentRules + '\n\nOutput ONLY valid JSX code. No markdown fences. No explanations.',
+
+    nextjs:
+      'You are a senior Next.js developer. Generate a complete single-file Next.js page component (JSX).\n\n' +
+      'CRITICAL FORMAT RULES:\n' +
+      '- First line MUST be: import React, { useState, useEffect } from "react";\n' +
+      '- Last line MUST be: export default Page;\n' +
+      '- Function name: function Page()\n' +
+      '- Use ONLY inline styles (style={{}}). NO className, NO external CSS files\n' +
+      '- Inject Google Fonts via useEffect adding a <link> element to document.head\n' +
+      '- All content in one self-contained file runnable in a CodeSandbox React template\n\n' +
+      styleBlock + '\n\n' + contentRules + '\n\nOutput ONLY valid JSX code. No markdown fences. No explanations.',
+
+    vue:
+      'You are a senior Vue.js developer. Generate a complete single-file Vue 3 SFC.\n\n' +
+      'CRITICAL FORMAT RULES:\n' +
+      '- Must have <template>, <script setup>, and <style scoped> sections\n' +
+      '- Use Vue 3 Composition API (ref, onMounted, computed)\n' +
+      '- Inject Google Fonts via onMounted adding a <link> to document.head\n' +
+      '- All styles in <style scoped> — no external imports\n' +
+      '- The SFC must run in a CodeSandbox Vue template\n\n' +
+      styleBlock + '\n\n' + contentRules + '\n\nOutput ONLY the .vue file content. No markdown fences.',
+
+    angular:
+      'You are a senior Angular developer. Generate a complete Angular standalone component (TypeScript).\n\n' +
+      'CRITICAL FORMAT RULES:\n' +
+      '- Import Component, OnInit from "@angular/core"\n' +
+      '- Use @Component({ standalone: true, selector: "app-root", template: `...`, styles: [...] })\n' +
+      '- Export class AppComponent implements OnInit\n' +
+      '- All template HTML uses Angular template syntax\n' +
+      '- All styles are inline in the styles array\n\n' +
+      styleBlock + '\n\n' + contentRules + '\n\nOutput ONLY the TypeScript file. No markdown fences.',
   };
 
-  const note = frameworkNotes[framework] || '';
-  const frameworkCode = note + previewHtml;
+  var fwPrompt = fwInstructions[framework];
+  if (!fwPrompt) {
+    return { style: style, styleName: sg.name, framework: 'html', frameworkLabel: fw.label, ext: 'html', code: previewHtml, previewHtml: previewHtml, previewType: 'html' };
+  }
+
+  console.log('[Redesigner] Generating ' + fw.label + ' code for style: ' + style);
+  var fwResult = await model.generateContent(fwPrompt);
+  var frameworkCode = cleanCode(fwResult.response.text());
+
+  if (!frameworkCode || frameworkCode.length < 100) {
+    console.warn('[Redesigner] ' + fw.label + ' generation failed, falling back to HTML preview');
+    return { style: style, styleName: sg.name, framework: framework, frameworkLabel: fw.label, ext: fw.ext, code: previewHtml, previewHtml: previewHtml, previewType: 'html' };
+  }
+
+  console.log('[Redesigner] ' + fw.label + ' code ready, length: ' + frameworkCode.length);
 
   return {
-    style,
+    style: style,
     styleName: sg.name,
-    framework,
+    framework: framework,
     frameworkLabel: fw.label,
-    ext: framework === 'html' ? 'html' : 'html', // always html for now
+    ext: fw.ext,
     code: frameworkCode,
-    previewHtml,
+    previewHtml: previewHtml,
+    previewType: 'sandpack',
   };
 }
+
 
 // ── SSE helper ────────────────────────────────────────────────────────────
 function sendSSE(res, event, data) {
