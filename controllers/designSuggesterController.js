@@ -1,5 +1,6 @@
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const puppeteer = require('puppeteer');
+const RedesignHistory = require('../models/redesignHistory');
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 
@@ -463,6 +464,18 @@ const redesignWebsite = async (req, res) => {
 
       sendSSE(res, 'design', { design });
       console.log(`[Redesigner] Streamed: ${key}`);
+
+      // Persist to DB (non-blocking — don't await, don't fail the stream)
+      const userId = req.user?.id || req.user?.userId || 'anonymous';
+      RedesignHistory.create({
+        userId,
+        websiteUrl,
+        styleName: design.styleName || key,
+        style: key,
+        framework: design.framework || framework || 'html',
+        frameworkLabel: design.frameworkLabel || '',
+        previewHtml: design.previewHtml || design.code || '',
+      }).catch(err => console.error('[Redesigner] DB save error:', err.message));
     }
 
     sendSSE(res, 'done', { success: true });

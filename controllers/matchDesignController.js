@@ -243,17 +243,17 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
     if (!el) continue;
     const bx = toPct(fn.box);
 
-    // Color
+    // Color — only flag if significantly different (distance > 50 to ignore subtle shifts)
     if (fn.fillColor) {
       const lc = cssColorToHex(el.styles.backgroundColor) || cssColorToHex(el.styles.color);
       if (lc && lc !== fn.fillColor) {
         const d = colorDist(fn.fillColor, lc);
         const key = `color_${fn.fillColor}_${lc}`;
-        if (d > 30 && !seen.has(key)) {
+        if (d > 50 && !seen.has(key)) {
           seen.add(key);
           issues.push({
             issueNumber: num++, category: 'Colors',
-            severity: d > 120 ? 'critical' : d > 60 ? 'major' : 'minor',
+            severity: d > 150 ? 'critical' : d > 80 ? 'major' : 'minor',
             title: `Color mismatch — ${fn.name || fn.type}`,
             description: `Fill color in Figma design differs from live site.`,
             location: fn.name || `${fn.type} at (${fn.box.x | 0},${fn.box.y | 0})`,
@@ -263,15 +263,15 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
       }
     }
 
-    // Font size
+    // Font size — only flag if difference is > 4px (ignore minor rendering variance)
     if (fn.fontSize && el.styles.fontSize) {
       const lp = parseFloat(el.styles.fontSize), fp = fn.fontSize;
       const key = `fs_${fp}_${lp}`;
-      if (Math.abs(lp - fp) > 2 && !seen.has(key)) {
+      if (Math.abs(lp - fp) > 4 && !seen.has(key)) {
         seen.add(key);
         issues.push({
           issueNumber: num++, category: 'Typography',
-          severity: Math.abs(lp - fp) > 8 ? 'major' : 'minor',
+          severity: Math.abs(lp - fp) > 10 ? 'major' : 'minor',
           title: `Font size mismatch — ${fn.name || fn.type}`,
           description: `Font size differs between Figma (${fp}px) and live site (${lp}px).`,
           location: fn.name || `Text at (${fn.box.x | 0},${fn.box.y | 0})`,
@@ -280,15 +280,15 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
       }
     }
 
-    // Font weight
+    // Font weight — only flag if difference is >= 200 (ignore 400 vs 500 etc.)
     if (fn.fontWeight && el.styles.fontWeight) {
       const lw = parseInt(el.styles.fontWeight), fw = fn.fontWeight;
       const key = `fw_${fw}_${lw}`;
-      if (Math.abs(lw - fw) >= 100 && !seen.has(key)) {
+      if (Math.abs(lw - fw) >= 200 && !seen.has(key)) {
         seen.add(key);
         issues.push({
           issueNumber: num++, category: 'Typography',
-          severity: 'minor',
+          severity: Math.abs(lw - fw) >= 400 ? 'major' : 'minor',
           title: `Font weight mismatch — ${fn.name || fn.type}`,
           description: `Font weight differs: Figma uses ${fw}, live site uses ${lw}.`,
           location: fn.name || `Element at (${fn.box.x | 0},${fn.box.y | 0})`,
@@ -297,15 +297,15 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
       }
     }
 
-    // Border radius
+    // Border radius — only flag if difference is > 6px (ignore minor rounding)
     if (fn.cornerRadius != null && el.styles.borderRadius) {
       const lr = parseFloat(el.styles.borderRadius), fr = fn.cornerRadius;
       const key = `br_${fr}_${lr}`;
-      if (Math.abs(lr - fr) > 2 && !seen.has(key)) {
+      if (Math.abs(lr - fr) > 6 && !seen.has(key)) {
         seen.add(key);
         issues.push({
           issueNumber: num++, category: 'Borders',
-          severity: 'minor',
+          severity: Math.abs(lr - fr) > 16 ? 'major' : 'minor',
           title: `Border radius mismatch — ${fn.name || fn.type}`,
           description: `Corner radius: Figma is ${fr}px, live site is ${lr}px.`,
           location: fn.name || `Element at (${fn.box.x | 0},${fn.box.y | 0})`,
@@ -314,22 +314,56 @@ function compareStyles(liveEls, figmaNodes, pgW, pgH) {
       }
     }
 
-    // Missing text
+    // Text content comparison — fuzzy word-level matching
     if (fn.text && fn.text.length > 2) {
-      const liveText = (el.text || '').toLowerCase();
-      const figText = fn.text.toLowerCase().slice(0, 60);
-      if (!liveText.includes(figText.slice(0, 20)) && figText.length > 5) {
-        const key = `txt_${figText.slice(0, 20)}`;
+      const liveText = (el.text || '').trim();
+      const figText = fn.text.trim().slice(0, 80);
+      if (figText.length > 3 && liveText.length > 0) {
+        // Word-level similarity: what fraction of Figma words appear in live text?
+        const figWords = figText.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        const liveWords = liveText.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        const matchCount = figWords.filter(w => liveWords.some(lw => lw.includes(w) || w.includes(lw))).length;
+        const similarity = figWords.length > 0 ? matchCount / figWords.length : 1;
+
+        // Flag if less than 60% of words match (catches "Full-Stack Developer" vs "Mobile App Developer")
+        if (similarity < 0.6) {
+          const key = `txt_${figText.slice(0, 30).toLowerCase()}`;
+          if (!seen.has(key)) {
+            seen.add(key);
+            const isTotallyDifferent = similarity < 0.2;
+            const isPartialMismatch = similarity >= 0.2;
+            issues.push({
+              issueNumber: num++, category: 'Content',
+              severity: isTotallyDifferent ? 'critical' : 'major',
+              title: isTotallyDifferent
+                ? `Text is incorrect — ${fn.name || 'text element'}`
+                : `Text content differs — ${fn.name || 'text element'}`,
+              description: isTotallyDifferent
+                ? `The text "${figText.slice(0, 50)}" from Figma was not found. Live site shows "${liveText.slice(0, 50)}" instead.`
+                : `Text partially differs from Figma design. Expected "${figText.slice(0, 50)}", found "${liveText.slice(0, 50)}".`,
+              location: fn.name || `Text at (${fn.box.x | 0},${fn.box.y | 0})`,
+              figmaValue: `"${figText.slice(0, 70)}"`,
+              liveValue: `"${liveText.slice(0, 70)}"`,
+              boundingBox: bx,
+              property: 'text-content',
+            });
+          }
+        }
+      } else if (figText.length > 3 && !liveText) {
+        // Figma has text but live element has no text at all
+        const key = `txt_missing_${figText.slice(0, 20).toLowerCase()}`;
         if (!seen.has(key)) {
           seen.add(key);
           issues.push({
             issueNumber: num++, category: 'Content',
-            severity: 'major',
-            title: `Content mismatch — ${fn.name || 'text node'}`,
-            description: `Text in Figma not found on live site.`,
+            severity: 'critical',
+            title: `Text missing — ${fn.name || 'text element'}`,
+            description: `The text "${figText.slice(0, 50)}" from Figma is missing on the live site.`,
             location: fn.name || `Text at (${fn.box.x | 0},${fn.box.y | 0})`,
-            figmaValue: `"${fn.text.slice(0, 60)}"`, liveValue: `"${(el.text || '(not found)').slice(0, 60)}"`,
-            boundingBox: bx
+            figmaValue: `"${figText.slice(0, 70)}"`,
+            liveValue: '(empty / not found)',
+            boundingBox: bx,
+            property: 'text-content',
           });
         }
       }
@@ -420,9 +454,9 @@ async function runPixelDiff(livePngBuf, figmaBuf) {
 
     const diffBuf = Buffer.alloc(W * stripH * 4);
     const numDiff = pixelmatch(liveRGBA, figmaRGBA, diffBuf, W, stripH, {
-      threshold: 0.12,  // more sensitive than before
+      threshold: 0.18,  // higher threshold to ignore sub-pixel/antialiasing noise
       includeAA: false,
-      alpha: 0.1,
+      alpha: 0.15,
     });
     totalDiffPixels += numDiff;
 
@@ -476,7 +510,8 @@ async function runPixelDiff(livePngBuf, figmaBuf) {
   return { matchPct, diffBase64, clusters: mergedClusters.slice(0, 50), W, H, sectionScores, layoutDivergence };
 }
 
-// Merge clusters that are vertically AND horizontally overlapping (within 2% proximity)
+// Merge clusters that are vertically AND horizontally overlapping (within 1% proximity)
+// Tighter proximity to avoid merging unrelated diff regions into giant boxes
 function mergeClusters(clusters) {
   if (clusters.length === 0) return [];
   const sorted = [...clusters].sort((a, b) => a.y - b.y);
@@ -484,9 +519,9 @@ function mergeClusters(clusters) {
   for (let i = 1; i < sorted.length; i++) {
     const last = merged[merged.length - 1];
     const cur = sorted[i];
-    // Only merge if vertically close AND horizontally overlapping
-    const vertClose = cur.y <= last.y + last.height + 2;
-    const horizOverlap = cur.x < last.x + last.width + 5 && cur.x + cur.width > last.x - 5;
+    // Only merge if vertically very close AND horizontally overlapping
+    const vertClose = cur.y <= last.y + last.height + 1;
+    const horizOverlap = cur.x < last.x + last.width + 3 && cur.x + cur.width > last.x - 3;
     if (vertClose && horizOverlap) {
       const newBottom = Math.max(last.y + last.height, cur.y + cur.height);
       last.x = Math.min(last.x, cur.x);
@@ -499,31 +534,47 @@ function mergeClusters(clusters) {
   // Cap any oversized cluster — split into smaller pieces if needed
   const capped = [];
   for (const c of merged) {
-    if (c.width > 55 && c.height > 25) {
+    if (c.width > 45 && c.height > 20) {
       // Split into 2 halves vertically
       const half = Math.floor(c.height / 2);
       capped.push({ x: c.x, y: c.y, width: c.width, height: half });
       capped.push({ x: c.x, y: c.y + half, width: c.width, height: c.height - half });
     } else {
       // Cap dimensions
-      capped.push({ ...c, width: Math.min(55, c.width), height: Math.min(25, c.height) });
+      capped.push({ ...c, width: Math.min(45, c.width), height: Math.min(20, c.height) });
     }
   }
   return capped;
 }
 
 /* ─── Cluster diff pixels → bounding boxes ──────────────────────────────── */
+// Uses density filtering: a block must have ≥15% diff pixels to count as "different".
+// This prevents noise from slight offsets/spacing from creating false highlights.
 function clusterDiffRegions(diffBuf, W, H) {
-  const BLOCK = 60; // larger blocks = more isolated, tighter clusters
-  const MAX_CLUSTER_BLOCKS = 80; // prevent one cluster from swallowing the page
+  const BLOCK = 80; // larger blocks = more isolated, tighter clusters
+  const MAX_CLUSTER_BLOCKS = 60; // prevent one cluster from swallowing the page
+  const MIN_CLUSTER_BLOCKS = 3;  // ignore tiny scattered noise
+  const DENSITY_THRESHOLD = 0.15; // block must have ≥15% diff pixels to be flagged
   const cols = Math.ceil(W / BLOCK), rows = Math.ceil(H / BLOCK);
-  const blocks = new Uint8Array(cols * rows);
+  const blockDiffCounts = new Uint32Array(cols * rows);
+  const blockTotalPixels = new Uint32Array(cols * rows);
 
+  // Count diff pixels per block (not just a binary flag)
   for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const bx = Math.floor(x / BLOCK), by = Math.floor(y / BLOCK);
+    const bIdx = by * cols + bx;
+    blockTotalPixels[bIdx]++;
     const i = (y * W + x) * 4;
     if (diffBuf[i] > 100 && diffBuf[i + 1] < 50) { // red pixel = diff
-      const bx = Math.floor(x / BLOCK), by = Math.floor(y / BLOCK);
-      blocks[by * cols + bx] = 1;
+      blockDiffCounts[bIdx]++;
+    }
+  }
+
+  // Convert to binary with density filter
+  const blocks = new Uint8Array(cols * rows);
+  for (let idx = 0; idx < cols * rows; idx++) {
+    if (blockTotalPixels[idx] > 0 && (blockDiffCounts[idx] / blockTotalPixels[idx]) >= DENSITY_THRESHOLD) {
+      blocks[idx] = 1;
     }
   }
 
@@ -545,7 +596,8 @@ function clusterDiffRegions(diffBuf, W, H) {
         visited[ny * cols + nx] = 1; queue.push([nx, ny]); inCluster.push([nx, ny]);
       }
     }
-    if (inCluster.length < 1) continue;
+    // Skip clusters that are too small (noise)
+    if (inCluster.length < MIN_CLUSTER_BLOCKS) continue;
     const minBX = Math.min(...inCluster.map(c => c[0]));
     const maxBX = Math.max(...inCluster.map(c => c[0]));
     const minBY = Math.min(...inCluster.map(c => c[1]));
@@ -553,26 +605,38 @@ function clusterDiffRegions(diffBuf, W, H) {
     clusters.push({
       x: Math.round(((minBX * BLOCK) / W) * 100),
       y: Math.round(((minBY * BLOCK) / H) * 100),
-      width: Math.min(55, Math.round((((maxBX - minBX + 1) * BLOCK) / W) * 100)),
-      height: Math.min(25, Math.max(1, Math.round((((maxBY - minBY + 1) * BLOCK) / H) * 100))),
+      width: Math.min(45, Math.round((((maxBX - minBX + 1) * BLOCK) / W) * 100)),
+      height: Math.min(20, Math.max(1, Math.round((((maxBY - minBY + 1) * BLOCK) / H) * 100))),
     });
   }
   return clusters;
 }
 
 /* ─── Merge CSS + pixel issues into final mismatch list ─────────────────── */
+function describePixelRegion(box) {
+  const vPos = box.y < 15 ? 'top/header' : box.y < 40 ? 'upper' : box.y < 65 ? 'middle' : box.y < 85 ? 'lower' : 'bottom/footer';
+  const hPos = box.x < 30 ? 'left side' : box.x > 60 ? 'right side' : 'center';
+  const size = box.width * box.height;
+  if (size > 400) return { title: `Major layout difference in ${vPos} area`, desc: `A large visual difference was detected in the ${vPos} ${hPos} of the page. This may indicate a missing section, significantly different component, or major color/layout change.`, sev: 'critical' };
+  if (size > 100) return { title: `Visual mismatch in ${vPos} area`, desc: `A noticeable visual difference was found in the ${vPos} ${hPos}. Check for incorrect colors, different text, missing icons, or spacing issues.`, sev: 'major' };
+  return { title: `Minor visual difference in ${vPos} area`, desc: `A small visual difference in the ${vPos} ${hPos}. Could be a color shade, border, or small element difference.`, sev: 'minor' };
+}
+
 function buildMismatches(cssIssues, pixelClusters, startNum) {
-  const pixelIssues = pixelClusters.map((box, i) => ({
-    issueNumber: startNum + i,
-    category: 'Layout',
-    severity: 'major',
-    title: `Visual difference in region #${i + 1}`,
-    description: `Pixel comparison detected a visual difference in this region. Check colors, spacing, or missing/extra elements.`,
-    location: `Page region at ~${box.y}% from top`,
-    figmaValue: 'See Figma design',
-    liveValue: 'See live site',
-    boundingBox: box,
-  }));
+  const pixelIssues = pixelClusters.map((box, i) => {
+    const info = describePixelRegion(box);
+    return {
+      issueNumber: startNum + i,
+      category: 'Layout',
+      severity: info.sev,
+      title: info.title,
+      description: info.desc,
+      location: `Page region at ~${box.y}% from top, ~${box.x}% from left`,
+      figmaValue: 'Compare with Figma design',
+      liveValue: 'Differs from expected design',
+      boundingBox: box,
+    };
+  });
   return [...cssIssues, ...pixelIssues];
 }
 
