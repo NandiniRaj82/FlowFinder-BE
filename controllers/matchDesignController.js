@@ -391,8 +391,21 @@ async function runPixelDiff(livePngBuf, figmaBuf) {
     figmaPng = await parsePng(pngBuf);
   }
 
-  const W = Math.min(livePng.width, figmaPng.width, 1440);
-  // Use MAX height — the shorter image is padded so no pixels are skipped
+  // Normalize both images to the same width (1440px) to prevent width mismatch noise
+  const TARGET_W = 1440;
+  if (livePng.width !== TARGET_W) {
+    const j = await Jimp.fromBuffer(Buffer.from(PNG.sync.write(livePng)));
+    j.resize({ w: TARGET_W, h: Math.round(livePng.height * (TARGET_W / livePng.width)) });
+    const resized = await parsePng(await j.getBuffer('image/png'));
+    Object.assign(livePng, resized);
+  }
+  if (figmaPng.width !== TARGET_W) {
+    const j = await Jimp.fromBuffer(Buffer.from(PNG.sync.write(figmaPng)));
+    j.resize({ w: TARGET_W, h: Math.round(figmaPng.height * (TARGET_W / figmaPng.width)) });
+    const resized = await parsePng(await j.getBuffer('image/png'));
+    Object.assign(figmaPng, resized);
+  }
+  const W = TARGET_W;
   const liveH = livePng.height;
   const figmaH = figmaPng.height;
   const H = Math.max(liveH, figmaH);
@@ -454,9 +467,9 @@ async function runPixelDiff(livePngBuf, figmaBuf) {
 
     const diffBuf = Buffer.alloc(W * stripH * 4);
     const numDiff = pixelmatch(liveRGBA, figmaRGBA, diffBuf, W, stripH, {
-      threshold: 0.18,  // higher threshold to ignore sub-pixel/antialiasing noise
+      threshold: 0.22,  // very tolerant — ignore rendering variance and subtle differences
       includeAA: false,
-      alpha: 0.15,
+      alpha: 0.1,
     });
     totalDiffPixels += numDiff;
 
@@ -551,10 +564,10 @@ function mergeClusters(clusters) {
 // Uses density filtering: a block must have ≥15% diff pixels to count as "different".
 // This prevents noise from slight offsets/spacing from creating false highlights.
 function clusterDiffRegions(diffBuf, W, H) {
-  const BLOCK = 80; // larger blocks = more isolated, tighter clusters
-  const MAX_CLUSTER_BLOCKS = 60; // prevent one cluster from swallowing the page
-  const MIN_CLUSTER_BLOCKS = 3;  // ignore tiny scattered noise
-  const DENSITY_THRESHOLD = 0.15; // block must have ≥15% diff pixels to be flagged
+  const BLOCK = 100; // large blocks = coarse grid, much less noise sensitivity
+  const MAX_CLUSTER_BLOCKS = 50; // prevent one cluster from swallowing the page
+  const MIN_CLUSTER_BLOCKS = 5;  // ignore scattered noise — need significant area
+  const DENSITY_THRESHOLD = 0.25; // block must have ≥25% diff pixels to be flagged
   const cols = Math.ceil(W / BLOCK), rows = Math.ceil(H / BLOCK);
   const blockDiffCounts = new Uint32Array(cols * rows);
   const blockTotalPixels = new Uint32Array(cols * rows);

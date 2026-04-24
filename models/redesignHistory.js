@@ -17,6 +17,7 @@ const RedesignHistorySchema = new mongoose.Schema({
   previewHtml:    { type: String, default: '' },
 
   isSaved:        { type: Boolean, default: false },
+  prCreated:      { type: Boolean, default: false },
 
   createdAt:      { type: Date, default: Date.now, index: true },
 });
