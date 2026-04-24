@@ -387,6 +387,8 @@ function sendSSE(res, event, data) {
 // ── Main controller (SSE streaming) ──────────────────────────────────────
 const redesignWebsite = async (req, res) => {
   const { websiteUrl, selectedStyles, customPrompts = [], framework = 'html' } = req.body;
+  const userId = req.user?.uid;  // set by authMiddleware from Firebase token
+  console.log(`[Redesigner] userId=${userId} websiteUrl=${websiteUrl}`);
 
   if (!websiteUrl || !websiteUrl.startsWith('http')) {
     return res.status(400).json({ success: false, message: 'Valid website URL is required.' });
@@ -421,9 +423,11 @@ const redesignWebsite = async (req, res) => {
 
 
     // Build list of styles to generate
+    // Only default to presets if user selected NONE and has NO custom prompts
+    const hasCustom = customPrompts.some(p => p.trim().length > 5);
     const stylesList = selectedStyles && selectedStyles.length > 0
       ? selectedStyles
-      : ['minimal', 'bold', 'colorful'];
+      : (hasCustom ? [] : ['minimal', 'bold', 'colorful']);
 
     // Add custom styles for each non-empty custom prompt
     const customList = customPrompts
@@ -462,20 +466,26 @@ const redesignWebsite = async (req, res) => {
       );
       design.style = key; // ensure key is set (generateHTML may use 'custom')
 
-      sendSSE(res, 'design', { design });
-      console.log(`[Redesigner] Streamed: ${key}`);
+      // Persist to DB — await so we can include the _id in the SSE payload
+      let dbId = null;
+      try {
+        const saved = await RedesignHistory.create({
+          userId,
+          websiteUrl,
+          styleName: design.styleName || key,
+          style: key,
+          framework: design.framework || framework || 'html',
+          frameworkLabel: design.frameworkLabel || '',
+          previewHtml: design.previewHtml || design.code || '',
+        });
+        dbId = saved._id.toString();
+      } catch (err) {
+        console.error('[Redesigner] DB save error:', err.message);
+      }
 
-      // Persist to DB (non-blocking — don't await, don't fail the stream)
-      const userId = req.user?.id || req.user?.userId || 'anonymous';
-      RedesignHistory.create({
-        userId,
-        websiteUrl,
-        styleName: design.styleName || key,
-        style: key,
-        framework: design.framework || framework || 'html',
-        frameworkLabel: design.frameworkLabel || '',
-        previewHtml: design.previewHtml || design.code || '',
-      }).catch(err => console.error('[Redesigner] DB save error:', err.message));
+      // Stream design with the DB id included so frontend can PATCH isSaved later
+      sendSSE(res, 'design', { design: { ...design, dbId } });
+      console.log(`[Redesigner] Streamed: ${key} (dbId=${dbId})`);
     }
 
     sendSSE(res, 'done', { success: true });
