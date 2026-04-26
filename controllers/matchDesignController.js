@@ -27,10 +27,10 @@ async function runPixelDiff(liveBuf, figmaBuf) {
         const si = (y * png.width + x) * 4;
         const di = (y * w + x) * 4;
         if (x < png.width && y < png.height) {
-          buf[di] = png.data[si]; buf[di+1] = png.data[si+1];
-          buf[di+2] = png.data[si+2]; buf[di+3] = png.data[si+3];
+          buf[di] = png.data[si]; buf[di + 1] = png.data[si + 1];
+          buf[di + 2] = png.data[si + 2]; buf[di + 3] = png.data[si + 3];
         } else {
-          buf[di] = 255; buf[di+1] = 0; buf[di+2] = 255; buf[di+3] = 255;
+          buf[di] = 255; buf[di + 1] = 0; buf[di + 2] = 255; buf[di + 3] = 255;
         }
       }
     }
@@ -167,7 +167,7 @@ const matchDesign = async (req, res) => {
     const diffBase64 = pixelResult?.diffBase64 ?? '';
 
     // â”€â”€ VLM fallback for complex visual elements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    const vlmDrifts = await vlmFallbackCheck(screenshotBuf, figmaBuf, 
+    const vlmDrifts = await vlmFallbackCheck(screenshotBuf, figmaBuf,
       drifts.filter(d => d.category === 'missing'));
 
     // â”€â”€ Phase 5: Build final output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -194,7 +194,7 @@ const matchDesign = async (req, res) => {
     const critCount = mismatches.filter(m => m.severity === 'critical').length;
     const majCount = mismatches.filter(m => m.severity === 'major').length;
 
-    const { matchScore, projectedScore, verdict, verdictDetail } = 
+    const { matchScore, projectedScore, verdict, verdictDetail } =
       computeScores(pixelPct, overallScore, mismatches.length, critCount, majCount);
 
     // Section scores from spatial stats
@@ -262,7 +262,7 @@ function findWorstSection(scores) {
   if (!scores.length) return null;
   const minScore = Math.min(...scores);
   const idx = scores.indexOf(minScore);
-  const labels = ['Top (Hero/Header)','Upper section','','Mid-upper','','Middle','','Mid-lower','Lower section','Bottom (Footer)'];
+  const labels = ['Top (Hero/Header)', 'Upper section', '', 'Mid-upper', '', 'Middle', '', 'Mid-lower', 'Lower section', 'Bottom (Footer)'];
   return { sectionIndex: idx, matchPct: minScore, label: labels[idx] || `Section ${idx + 1}` };
 }
 
@@ -328,21 +328,21 @@ function selectFilesForDesignFix(tree, framework) {
 
     // Component / page files â€” highest relevance
     if (p.includes('component')) score += 20;
-    if (p.includes('page'))      score += 18;
-    if (p.includes('layout'))    score += 18;
+    if (p.includes('page')) score += 18;
+    if (p.includes('layout')) score += 18;
     if (p.includes('header') || p.includes('nav') || p.includes('footer')) score += 15;
     if (p.includes('hero') || p.includes('banner') || p.includes('section')) score += 12;
     if (p.includes('card') || p.includes('button') || p.includes('sidebar')) score += 10;
-    if (p.includes('form') || p.includes('input') || p.includes('modal'))  score += 8;
+    if (p.includes('form') || p.includes('input') || p.includes('modal')) score += 8;
     if (p.includes('home') || p.includes('landing') || p.includes('main')) score += 15;
-    if (p.includes('app'))       score += 10;
-    if (p.includes('index'))     score += 8;
+    if (p.includes('app')) score += 10;
+    if (p.includes('index')) score += 8;
 
     // Style files â€” always relevant for design fixes
     if (p.endsWith('.css') || p.endsWith('.scss') || p.endsWith('.sass') || p.endsWith('.less')) score += 20;
     if (p.includes('global') || p.includes('style') || p.includes('theme')) score += 18;
-    if (p.includes('variable') || p.includes('_var'))  score += 12;
-    if (p.includes('tailwind.config'))                 score += 25;
+    if (p.includes('variable') || p.includes('_var')) score += 12;
+    if (p.includes('tailwind.config')) score += 25;
     if (p.includes('module.css') || p.includes('module.scss')) score += 15;
 
     // Extension bonuses
@@ -403,14 +403,14 @@ function fuzzyReplace(fileContent, originalCode, fixedCode) {
 const MAX_FULL_FILE = 40000; // chars â€” match sourceMapper limit
 
 const FRAMEWORK_HINTS = {
-  'nextjs-tailwind':  'Next.js + Tailwind CSS. Fix via tailwind.config.js theme values, globals.css, or updating className strings in .tsx/.jsx files.',
-  'react-tailwind':   'React + Tailwind CSS. Fix via tailwind.config.js theme values or className strings in JSX.',
-  'nextjs-styled':    'Next.js + styled-components/emotion. Fix the styled component definitions.',
-  'nextjs-css':       'Next.js + CSS Modules. Fix .module.css files and globals.css.',
-  'vue':              'Vue.js project. Fix <style> sections of .vue SFCs or separate CSS files.',
-  'svelte':           'Svelte project. Fix <style> sections of .svelte files.',
-  'react-bootstrap':  'React + Bootstrap. Fix SCSS variable overrides (_variables.scss).',
-  'css':              'Plain CSS/SCSS project. Fix CSS/SCSS files directly.',
+  'nextjs-tailwind': 'Next.js + Tailwind CSS. Fix via tailwind.config.js theme values, globals.css, or updating className strings in .tsx/.jsx files.',
+  'react-tailwind': 'React + Tailwind CSS. Fix via tailwind.config.js theme values or className strings in JSX.',
+  'nextjs-styled': 'Next.js + styled-components/emotion. Fix the styled component definitions.',
+  'nextjs-css': 'Next.js + CSS Modules. Fix .module.css files and globals.css.',
+  'vue': 'Vue.js project. Fix <style> sections of .vue SFCs or separate CSS files.',
+  'svelte': 'Svelte project. Fix <style> sections of .svelte files.',
+  'react-bootstrap': 'React + Bootstrap. Fix SCSS variable overrides (_variables.scss).',
+  'css': 'Plain CSS/SCSS project. Fix CSS/SCSS files directly.',
 };
 
 /* â”€â”€â”€ Per-mismatch: find best candidate file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
