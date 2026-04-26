@@ -1,57 +1,65 @@
 'use strict';
 const { PNG } = require('pngjs');
 const pixelmatch = require('pixelmatch');
+const sharp = require('sharp');
 const DesignScan = require('../models/designScan');
 const UserProfile = require('../models/userProfile');
 const { ingestFigma, ingestLiveSite } = require('../services/hybridIngestion');
 const { runSpatialComparison, bboxToPercentWithDimensions } = require('../services/spatialMatcher');
 
+/* ─── Sharp-based image normalizer ─────────────────────────────────────────── */
+async function normalizeToSameSize(buf1, buf2) {
+  // Get dimensions of both images
+  const [meta1, meta2] = await Promise.all([sharp(buf1).metadata(), sharp(buf2).metadata()]);
+  console.log(`[PixelDiff] Live: ${meta1.width}×${meta1.height}, Figma: ${meta2.width}×${meta2.height}`);
 
-/* â”€â”€â”€ Pixel diff (lightweight backup) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+  // Use Figma dimensions as reference (it's the design source of truth)
+  const targetW = meta2.width;
+  const targetH = meta2.height;
+
+  // Resize live screenshot to match Figma exactly
+  // Use 'cover' fit so it fills the target dimensions without distortion
+  const [normalized1, normalized2] = await Promise.all([
+    sharp(buf1)
+      .resize(targetW, targetH, { fit: 'cover', position: 'top' })
+      .png()
+      .toBuffer(),
+    buf2, // Figma is already at target size
+  ]);
+  return { buf1: normalized1, buf2: normalized2, width: targetW, height: targetH };
+}
+
+/* ─── Pixel diff (sharp-normalized) ────────────────────────────────────────── */
 async function runPixelDiff(liveBuf, figmaBuf) {
-  const parsePng = buf => new Promise((res, rej) => {
-    const p = new PNG(); p.parse(buf, (e, d) => e ? rej(e) : res(d));
-  });
-  let livePng, figmaPng;
-  try { livePng = await parsePng(liveBuf); } catch { return null; }
-  try { figmaPng = await parsePng(figmaBuf); } catch { return null; }
+  try {
+    // Step 1: Normalize both images to identical dimensions using sharp
+    const { buf1: normalizedLive, buf2: normalizedFigma, width: W, height: H } =
+      await normalizeToSameSize(liveBuf, figmaBuf);
 
-  const W = Math.min(livePng.width, figmaPng.width, 1440);
-  const H = Math.min(livePng.height, figmaPng.height, 6000);
+    // Step 2: Parse normalized PNGs
+    const parsePng = buf => new Promise((res, rej) => {
+      const p = new PNG(); p.parse(buf, (e, d) => e ? rej(e) : res(d));
+    });
+    const [livePng, figmaPng] = await Promise.all([parsePng(normalizedLive), parsePng(normalizedFigma)]);
 
-  // Resize both to same dimensions using simple crop
-  const getPixels = (png, w, h) => {
-    const buf = Buffer.alloc(w * h * 4);
-    for (let y = 0; y < h; y++) {
-      for (let x = 0; x < w; x++) {
-        const si = (y * png.width + x) * 4;
-        const di = (y * w + x) * 4;
-        if (x < png.width && y < png.height) {
-          buf[di] = png.data[si]; buf[di + 1] = png.data[si + 1];
-          buf[di + 2] = png.data[si + 2]; buf[di + 3] = png.data[si + 3];
-        } else {
-          buf[di] = 255; buf[di + 1] = 0; buf[di + 2] = 255; buf[di + 3] = 255;
-        }
-      }
-    }
-    return buf;
-  };
+    // Step 3: Run pixelmatch on same-size images
+    // threshold: 0.20 — more tolerant of anti-aliasing and sub-pixel rendering
+    const diffData = Buffer.alloc(W * H * 4);
+    const numDiff = pixelmatch(livePng.data, figmaPng.data, diffData, W, H, {
+      threshold: 0.20, includeAA: false, alpha: 0.1,
+    });
 
-  const liveRGBA = getPixels(livePng, W, H);
-  const figmaRGBA = getPixels(figmaPng, W, H);
-  const diffData = Buffer.alloc(W * H * 4);
-  const numDiff = pixelmatch(liveRGBA, figmaRGBA, diffData, W, H, {
-    threshold: 0.12, includeAA: false, alpha: 0.1,
-  });
+    const matchPct = Math.max(0, Math.min(100, Math.round((1 - numDiff / (W * H)) * 100)));
 
-  const matchPct = Math.max(0, Math.min(100, Math.round((1 - numDiff / (W * H)) * 100)));
+    const diffPng = new PNG({ width: W, height: H });
+    diffData.copy(diffPng.data);
+    const diffBase64 = PNG.sync.write(diffPng).toString('base64');
 
-  // Build diff image
-  const diffPng = new PNG({ width: W, height: H });
-  diffData.copy(diffPng.data);
-  const diffBase64 = PNG.sync.write(diffPng).toString('base64');
-
-  return { matchPct, diffBase64, W, H };
+    return { matchPct, diffBase64, W, H };
+  } catch (e) {
+    console.warn('[PixelDiff] Failed:', e.message);
+    return null;
+  }
 }
 
 /* â”€â”€â”€ Score computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */

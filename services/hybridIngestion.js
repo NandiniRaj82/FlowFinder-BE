@@ -59,7 +59,7 @@ async function ingestFigma(figmaUrl, figmaToken) {
   const frameWidth = frameBbox ? Math.round(frameBbox.width) : 1440;
   const frameHeight = frameBbox ? Math.round(frameBbox.height) : 900;
 
-  // Export PNG
+  // Export PNG at scale=1 (100% — matches what browser renders at 1:1 pixel ratio)
   let exportUrl;
   for (let i = 1; i <= 3; i++) {
     try {
@@ -89,15 +89,29 @@ async function ingestLiveSite(url, viewportWidth, viewportHeight) {
   try {
     browser = await puppeteer.launch({
       headless: 'new',
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        // Force 100% zoom / no scaling
+        '--force-device-scale-factor=1',
+        '--high-dpi-support=1',
+      ],
     });
     const page = await browser.newPage();
 
-    // CRITICAL: Force viewport to match Figma frame dimensions
+    // CRITICAL: Match Figma frame WIDTH exactly.
+    // Use a STANDARD window height (900px) — NOT the Figma frame height.
+    // The Figma frame height may be 4000-8000px which forces the page to render
+    // in "giant viewport" mode, causing layout shifts and scale differences.
+    // fullPage:true in the screenshot still captures the full scrollable page.
+    const targetWidth = Math.max(320, Math.min(viewportWidth, 2560));
+    const windowHeight = 900; // Standard desktop browser height
+
     await page.setViewport({
-      width: Math.max(320, Math.min(viewportWidth, 2560)),
-      height: Math.max(480, Math.min(viewportHeight, 8000)),
-      deviceScaleFactor: 1,
+      width: targetWidth,
+      height: windowHeight,
+      deviceScaleFactor: 1, // Ensure no HiDPI scaling — renders at exactly 1:1 pixel ratio
     });
 
     // Freeze animations before page loads
@@ -144,6 +158,8 @@ async function ingestLiveSite(url, viewportWidth, viewportHeight) {
     await new Promise(r => setTimeout(r, 2000));
 
     // Phase 1 Data Extraction: DOM traversal payload
+    // Note: DOM positions are relative to the page origin (scrollY added)
+    // and are in the same pixel space as the viewport width we set.
     const domElements = await page.evaluate(() => {
       const TAGS = 'h1,h2,h3,h4,h5,h6,p,a,button,nav,header,footer,section,main,article,ul,li,ol,input,textarea,select,form,img,svg,span,div,label,figure,figcaption,blockquote,table,th,td';
       const results = [];
@@ -207,7 +223,7 @@ async function ingestLiveSite(url, viewportWidth, viewportHeight) {
       return results;
     });
 
-    // Full-page screenshot as backup
+    // Full-page screenshot — captures entire scrollable page at deviceScaleFactor:1
     const screenshotBuf = await page.screenshot({ type: 'png', fullPage: true });
 
     console.log(`[Ingestion] Live site: ${domElements.length} DOM elements extracted`);
