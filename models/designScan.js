@@ -21,27 +21,27 @@ const MismatchSchema = new mongoose.Schema({
 }, { _id: false });
 
 const DesignScanSchema = new mongoose.Schema({
-  userId:    { type: String, required: true, index: true },
+  userId: { type: String, required: true, index: true },
   websiteUrl: { type: String, required: true },
-  figmaUrl:   { type: String, required: true },
+  figmaUrl: { type: String, required: true },
 
   // Scores & analysis
-  matchScore:        Number,
-  projectedScore:    Number,
+  matchScore: Number,
+  projectedScore: Number,
   pixelMatchPercent: Number,
-  layoutDivergence:  Number,
-  verdict:           { type: String, enum: ['excellent','good','partial','divergent','unrelated'] },
-  verdictDetail:     String,
-  sectionScores:     [Number],   // 10-element array
-  worstSection:      mongoose.Schema.Types.Mixed,
-  totalIssues:       { type: Number, default: 0 },
-  mismatches:        [MismatchSchema],
+  layoutDivergence: Number,
+  verdict: { type: String, enum: ['excellent', 'good', 'partial', 'divergent', 'unrelated'] },
+  verdictDetail: String,
+  sectionScores: [Number],   // 10-element array
+  worstSection: mongoose.Schema.Types.Mixed,
+  totalIssues: { type: Number, default: 0 },
+  mismatches: [MismatchSchema],
 
   // Screenshots stored as base64 strings
   // For high-scale, migrate to S3 presigned URLs
   websiteScreenshotBase64: String,
-  figmaScreenshotBase64:   String,
-  diffImageBase64:          String,
+  figmaScreenshotBase64: String,
+  diffImageBase64: String,
 
   status: {
     type: String,

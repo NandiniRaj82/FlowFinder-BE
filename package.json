@@ -36,6 +36,7 @@
     "puppeteer": "^24.39.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "sharp": "^0.34.5",
     "simple-git": "^3.36.0",
     "unzipper": "^0.12.3"
   },

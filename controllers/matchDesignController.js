@@ -1,674 +1,81 @@
 'use strict';
-const puppeteer = require('puppeteer');
-const axios = require('axios');
-const { Jimp } = require('jimp');   // v1 named export
 const { PNG } = require('pngjs');
 const pixelmatch = require('pixelmatch');
+const sharp = require('sharp');
 const DesignScan = require('../models/designScan');
 const UserProfile = require('../models/userProfile');
+const { ingestFigma, ingestLiveSite } = require('../services/hybridIngestion');
+const { runSpatialComparison, bboxToPercentWithDimensions } = require('../services/spatialMatcher');
 
-/* ─── URL helpers ────────────────────────────────────────────────────────── */
-function extractFigmaFileKey(url) {
-  const m = url.match(/figma\.com\/(?:design|file|proto)\/([a-zA-Z0-9]+)/);
-  if (!m) throw new Error('Invalid Figma URL.');
-  return m[1];
+/* ─── Sharp-based image normalizer ─────────────────────────────────────────── */
+async function normalizeToSameSize(buf1, buf2) {
+  // Get dimensions of both images
+  const [meta1, meta2] = await Promise.all([sharp(buf1).metadata(), sharp(buf2).metadata()]);
+  console.log(`[PixelDiff] Live: ${meta1.width}×${meta1.height}, Figma: ${meta2.width}×${meta2.height}`);
+
+  // Use Figma dimensions as reference (it's the design source of truth)
+  const targetW = meta2.width;
+  const targetH = meta2.height;
+
+  // Resize live screenshot to match Figma exactly
+  // Use 'cover' fit so it fills the target dimensions without distortion
+  const [normalized1, normalized2] = await Promise.all([
+    sharp(buf1)
+      .resize(targetW, targetH, { fit: 'cover', position: 'top' })
+      .png()
+      .toBuffer(),
+    buf2, // Figma is already at target size
+  ]);
+  return { buf1: normalized1, buf2: normalized2, width: targetW, height: targetH };
 }
-function extractFigmaNodeId(url) {
+
+/* ─── Pixel diff (sharp-normalized) ────────────────────────────────────────── */
+async function runPixelDiff(liveBuf, figmaBuf) {
   try {
-    const id = new URL(url).searchParams.get('node-id');
-    return id ? id.replace(/-/g, ':') : null;
-  } catch { return null; }
-}
-function rgbToHex(r, g, b) {
-  return '#' + [r, g, b].map(v => Math.round(v).toString(16).padStart(2, '0')).join('').toUpperCase();
-}
-function cssColorToHex(css) {
-  if (!css || css === 'transparent' || css.includes('rgba(0, 0, 0, 0)')) return null;
-  const m = css.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
-  return m ? rgbToHex(+m[1], +m[2], +m[3]) : null;
-}
-function colorDist(a, b) {
-  try {
-    const h2r = h => { const n = parseInt(h.replace('#', ''), 16); return [(n >> 16) & 255, (n >> 8) & 255, n & 255]; };
-    const [r1, g1, b1] = h2r(a), [r2, g2, b2] = h2r(b);
-    return Math.abs(r1 - r2) + Math.abs(g1 - g2) + Math.abs(b1 - b2);
-  } catch { return 0; }
-}
+    // Step 1: Normalize both images to identical dimensions using sharp
+    const { buf1: normalizedLive, buf2: normalizedFigma, width: W, height: H } =
+      await normalizeToSameSize(liveBuf, figmaBuf);
 
-/* ─── Layer 1: Animation-frozen full-page screenshot ────────────────────── */
-const FREEZE_CSS = `*,*::before,*::after{
-  animation-duration:0.001ms!important;animation-delay:-1ms!important;
-  transition-duration:0.001ms!important;transition-delay:0ms!important;
-  scroll-behavior:auto!important;}`;
+    // Step 2: Parse normalized PNGs
+    const parsePng = buf => new Promise((res, rej) => {
+      const p = new PNG(); p.parse(buf, (e, d) => e ? rej(e) : res(d));
+    });
+    const [livePng, figmaPng] = await Promise.all([parsePng(normalizedLive), parsePng(normalizedFigma)]);
 
-async function freezeAndScreenshot(url) {
-  let browser;
-  try {
-    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
-
-    // Inject freeze CSS before page runs any JS
-    await page.evaluateOnNewDocument(css => {
-      Object.defineProperty(document, '__ffFreeze', { value: true });
-      document.addEventListener('DOMContentLoaded', () => {
-        const s = document.createElement('style'); s.textContent = css;
-        document.head.prepend(s);
-      });
-    }, FREEZE_CSS);
-
-    try { await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 }); }
-    catch { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 }); }
-
-    await page.addStyleTag({ content: FREEZE_CSS });
-    await page.evaluate(() => document.fonts.ready).catch(() => { });
-
-    // Force intersection-observer hidden elements to show
-    await page.evaluate(() => {
-      document.querySelectorAll('[data-aos],[data-animate],.aos-init,.fade-up,.fade-in,.hidden,.invisible,[style*="opacity: 0"]').forEach(el => {
-        el.style.cssText += ';opacity:1!important;visibility:visible!important;transform:none!important';
-      });
-      // Force lazy images
-      document.querySelectorAll('img[loading="lazy"],img[data-src]').forEach(img => {
-        if (img.dataset.src) img.src = img.dataset.src;
-        img.removeAttribute('loading');
-      });
+    // Step 3: Run pixelmatch on same-size images
+    // threshold: 0.20 — more tolerant of anti-aliasing and sub-pixel rendering
+    const diffData = Buffer.alloc(W * H * 4);
+    const numDiff = pixelmatch(livePng.data, figmaPng.data, diffData, W, H, {
+      threshold: 0.20, includeAA: false, alpha: 0.1,
     });
 
-    // Scroll to trigger lazy loading
-    await page.evaluate(async () => {
-      let pos = 0;
-      while (pos < document.body.scrollHeight) {
-        window.scrollTo(0, pos); pos += 400;
-        await new Promise(r => setTimeout(r, 80));
-      }
-      window.scrollTo(0, 0);
-    });
-    await new Promise(r => setTimeout(r, 2000));
+    const matchPct = Math.max(0, Math.min(100, Math.round((1 - numDiff / (W * H)) * 100)));
 
-    return await page.screenshot({ type: 'png', fullPage: true }); // returns Buffer
-  } finally { if (browser) await browser.close(); }
+    const diffPng = new PNG({ width: W, height: H });
+    diffData.copy(diffPng.data);
+    const diffBase64 = PNG.sync.write(diffPng).toString('base64');
+
+    return { matchPct, diffBase64, W, H };
+  } catch (e) {
+    console.warn('[PixelDiff] Failed:', e.message);
+    return null;
+  }
 }
 
-/* ─── Layer 2A: Extract live CSS from DOM ───────────────────────────────── */
-async function extractLiveStyles(url) {
-  let browser;
-  try {
-    browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'] });
-    const page = await browser.newPage();
-    await page.setViewport({ width: 1440, height: 900, deviceScaleFactor: 1 });
-    await page.evaluateOnNewDocument(css => {
-      document.addEventListener('DOMContentLoaded', () => {
-        const s = document.createElement('style'); s.textContent = css; document.head.prepend(s);
-      });
-    }, FREEZE_CSS);
-    try { await page.goto(url, { waitUntil: 'networkidle0', timeout: 60000 }); }
-    catch { await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 }); }
-    await page.evaluate(() => document.fonts.ready).catch(() => { });
-    await page.evaluate(() => {
-      document.querySelectorAll('[data-aos],[data-animate],.aos-init,.fade-up,.fade-in,.hidden,.invisible').forEach(el => {
-        el.style.cssText += ';opacity:1!important;visibility:visible!important;transform:none!important';
-      });
-    });
-    await new Promise(r => setTimeout(r, 2000));
+/* â”€â”€â”€ Score computation â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+function computeScores(pixelPct, spatialScore, driftCount, critCount, majCount) {
+  // Blend pixel match and spatial match
+  const blended = Math.round(pixelPct * 0.4 + spatialScore * 0.6);
+  const matchScore = Math.max(0, Math.min(100, blended));
 
-    return await page.evaluate(() => {
-      const TAGS = 'h1,h2,h3,h4,h5,h6,p,a,button,nav,header,footer,section,main,article,ul,li,input,form,img,span,div';
-      const results = [];
-      document.querySelectorAll(TAGS).forEach(el => {
-        const rect = el.getBoundingClientRect();
-        if (rect.width < 2 || rect.height < 2) return;
-        // No hard cap — extract styles for the full page
-        if (rect.top > 30000) return;
-        const cs = window.getComputedStyle(el);
-        results.push({
-          tag: el.tagName.toLowerCase(),
-          text: (el.textContent || '').trim().slice(0, 80),
-          rect: { x: Math.round(rect.left), y: Math.round(rect.top + window.scrollY), width: Math.round(rect.width), height: Math.round(rect.height) },
-          styles: {
-            color: cs.color,
-            backgroundColor: cs.backgroundColor,
-            fontSize: cs.fontSize,
-            fontFamily: cs.fontFamily,
-            fontWeight: cs.fontWeight,
-            lineHeight: cs.lineHeight,
-            padding: cs.padding,
-            borderRadius: cs.borderRadius,
-            border: cs.border,
-            boxShadow: cs.boxShadow,
-          }
-        });
-      });
-      return results;
-    });
-  } finally { if (browser) await browser.close(); }
-}
+  // Projected: how much we can fix via CSS
+  const fixablePenalty = Math.min(30, critCount * 6 + majCount * 3);
+  const projectedScore = Math.min(100, matchScore + fixablePenalty + 5);
 
-/* ─── Layer 2B: Figma PNG + design tokens ───────────────────────────────── */
-async function fetchFigmaData(figmaUrl, figmaToken) {
-  const fileKey = extractFigmaFileKey(figmaUrl);
-  let targetNodeId = extractFigmaNodeId(figmaUrl);
-
-  if (!targetNodeId) {
-    for (let i = 1; i <= 2; i++) {
-      try {
-        console.log(`[MatchDesign] Figma metadata attempt ${i}/2`);
-        const r = await axios.get(`https://api.figma.com/v1/files/${fileKey}`, { headers: { 'X-Figma-Token': figmaToken }, timeout: 60000 });
-        const frame = r.data.document.children[0]?.children?.[0];
-        if (!frame) throw new Error('No frames found.');
-        targetNodeId = frame.id; break;
-      } catch (e) {
-        if (i < 2) await new Promise(r => setTimeout(r, 3000)); else throw e;
-      }
-    }
-  } else { console.log(`[MatchDesign] Using node-id: ${targetNodeId}`); }
-
-  let exportUrl;
-  for (let i = 1; i <= 3; i++) {
-    try {
-      console.log(`[MatchDesign] Figma export attempt ${i}/3`);
-      const r = await axios.get(
-        `https://api.figma.com/v1/images/${fileKey}?ids=${encodeURIComponent(targetNodeId)}&format=png&scale=1`,
-        { headers: { 'X-Figma-Token': figmaToken }, timeout: 60000 }
-      );
-      exportUrl = r.data.images[targetNodeId];
-      if (exportUrl) break; throw new Error('Empty URL');
-    } catch (e) {
-      if (i < 3) await new Promise(r => setTimeout(r, 5000)); else throw e;
-    }
-  }
-
-  const dl = await axios.get(exportUrl, { responseType: 'arraybuffer', timeout: 120000 });
-  const figmaBuf = Buffer.from(dl.data);
-
-  // Fetch node design tokens
-  let figmaNodes = [];
-  try {
-    const nr = await axios.get(
-      `https://api.figma.com/v1/files/${fileKey}/nodes?ids=${encodeURIComponent(targetNodeId)}`,
-      { headers: { 'X-Figma-Token': figmaToken }, timeout: 60000 }
-    );
-    const doc = nr.data.nodes[targetNodeId]?.document;
-    if (doc) figmaNodes = flattenFigmaNodes(doc);
-  } catch (e) { console.log('[MatchDesign] Node tree skipped:', e.message); }
-
-  return { figmaBuf, figmaNodes };
-}
-
-function flattenFigmaNodes(node, out = []) {
-  if (!node) return out;
-  const n = { id: node.id, name: node.name, type: node.type, box: node.absoluteBoundingBox || null };
-  if (node.fills) {
-    const f = node.fills.find(f => f.type === 'SOLID' && f.visible !== false);
-    if (f?.color) { const { r, g, b } = f.color; n.fillColor = rgbToHex(r * 255, g * 255, b * 255); }
-  }
-  if (node.style) {
-    n.fontSize = node.style.fontSize; n.fontWeight = node.style.fontWeight;
-    n.fontFamily = node.style.fontFamily; n.lineHeight = node.style.lineHeightPx;
-  }
-  if (node.type === 'TEXT') n.text = node.characters;
-  if (node.cornerRadius != null) n.cornerRadius = node.cornerRadius;
-  out.push(n);
-  (node.children || []).forEach(c => flattenFigmaNodes(c, out));
-  return out;
-}
-
-/* ─── Layer 2C: CSS vs Figma token comparison ───────────────────────────── */
-function compareStyles(liveEls, figmaNodes, pgW, pgH) {
-  const issues = [], seen = new Set();
-  let num = 1;
-
-  const toPct = box => box ? {
-    x: Math.max(0, Math.round((box.x / pgW) * 100)),
-    y: Math.max(0, Math.round((box.y / pgH) * 100)),
-    width: Math.min(100, Math.round((box.width / pgW) * 100)),
-    height: Math.min(90, Math.max(2, Math.round((box.height / pgH) * 100))),
-  } : { x: 0, y: 0, width: 100, height: 5 };
-
-  const closest = (box) => {
-    if (!box) return null;
-    let best = null, bd = Infinity;
-    for (const el of liveEls) {
-      const dx = (el.rect.x + el.rect.width / 2) - (box.x + box.width / 2);
-      const dy = (el.rect.y + el.rect.height / 2) - (box.y + box.height / 2);
-      const d = Math.hypot(dx, dy);
-      if (d < bd) { bd = d; best = el; }
-    }
-    return bd < 600 ? best : null;
-  };
-
-  for (const fn of figmaNodes) {
-    if (!fn.box || ['FRAME', 'GROUP', 'COMPONENT', 'INSTANCE', 'DOCUMENT', 'CANVAS'].includes(fn.type)) continue;
-    const el = closest(fn.box);
-    if (!el) continue;
-    const bx = toPct(fn.box);
-
-    // Color — only flag if significantly different (distance > 50 to ignore subtle shifts)
-    if (fn.fillColor) {
-      const lc = cssColorToHex(el.styles.backgroundColor) || cssColorToHex(el.styles.color);
-      if (lc && lc !== fn.fillColor) {
-        const d = colorDist(fn.fillColor, lc);
-        const key = `color_${fn.fillColor}_${lc}`;
-        if (d > 50 && !seen.has(key)) {
-          seen.add(key);
-          issues.push({
-            issueNumber: num++, category: 'Colors',
-            severity: d > 150 ? 'critical' : d > 80 ? 'major' : 'minor',
-            title: `Color mismatch — ${fn.name || fn.type}`,
-            description: `Fill color in Figma design differs from live site.`,
-            location: fn.name || `${fn.type} at (${fn.box.x | 0},${fn.box.y | 0})`,
-            figmaValue: fn.fillColor, liveValue: lc, boundingBox: bx
-          });
-        }
-      }
-    }
-
-    // Font size — only flag if difference is > 4px (ignore minor rendering variance)
-    if (fn.fontSize && el.styles.fontSize) {
-      const lp = parseFloat(el.styles.fontSize), fp = fn.fontSize;
-      const key = `fs_${fp}_${lp}`;
-      if (Math.abs(lp - fp) > 4 && !seen.has(key)) {
-        seen.add(key);
-        issues.push({
-          issueNumber: num++, category: 'Typography',
-          severity: Math.abs(lp - fp) > 10 ? 'major' : 'minor',
-          title: `Font size mismatch — ${fn.name || fn.type}`,
-          description: `Font size differs between Figma (${fp}px) and live site (${lp}px).`,
-          location: fn.name || `Text at (${fn.box.x | 0},${fn.box.y | 0})`,
-          figmaValue: `${fp}px`, liveValue: `${lp}px`, boundingBox: bx
-        });
-      }
-    }
-
-    // Font weight — only flag if difference is >= 200 (ignore 400 vs 500 etc.)
-    if (fn.fontWeight && el.styles.fontWeight) {
-      const lw = parseInt(el.styles.fontWeight), fw = fn.fontWeight;
-      const key = `fw_${fw}_${lw}`;
-      if (Math.abs(lw - fw) >= 200 && !seen.has(key)) {
-        seen.add(key);
-        issues.push({
-          issueNumber: num++, category: 'Typography',
-          severity: Math.abs(lw - fw) >= 400 ? 'major' : 'minor',
-          title: `Font weight mismatch — ${fn.name || fn.type}`,
-          description: `Font weight differs: Figma uses ${fw}, live site uses ${lw}.`,
-          location: fn.name || `Element at (${fn.box.x | 0},${fn.box.y | 0})`,
-          figmaValue: `${fw}`, liveValue: `${lw}`, boundingBox: bx
-        });
-      }
-    }
-
-    // Border radius — only flag if difference is > 6px (ignore minor rounding)
-    if (fn.cornerRadius != null && el.styles.borderRadius) {
-      const lr = parseFloat(el.styles.borderRadius), fr = fn.cornerRadius;
-      const key = `br_${fr}_${lr}`;
-      if (Math.abs(lr - fr) > 6 && !seen.has(key)) {
-        seen.add(key);
-        issues.push({
-          issueNumber: num++, category: 'Borders',
-          severity: Math.abs(lr - fr) > 16 ? 'major' : 'minor',
-          title: `Border radius mismatch — ${fn.name || fn.type}`,
-          description: `Corner radius: Figma is ${fr}px, live site is ${lr}px.`,
-          location: fn.name || `Element at (${fn.box.x | 0},${fn.box.y | 0})`,
-          figmaValue: `${fr}px`, liveValue: `${lr}px`, boundingBox: bx
-        });
-      }
-    }
-
-    // Text content comparison — fuzzy word-level matching
-    if (fn.text && fn.text.length > 2) {
-      const liveText = (el.text || '').trim();
-      const figText = fn.text.trim().slice(0, 80);
-      if (figText.length > 3 && liveText.length > 0) {
-        // Word-level similarity: what fraction of Figma words appear in live text?
-        const figWords = figText.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-        const liveWords = liveText.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-        const matchCount = figWords.filter(w => liveWords.some(lw => lw.includes(w) || w.includes(lw))).length;
-        const similarity = figWords.length > 0 ? matchCount / figWords.length : 1;
-
-        // Flag if less than 60% of words match (catches "Full-Stack Developer" vs "Mobile App Developer")
-        if (similarity < 0.6) {
-          const key = `txt_${figText.slice(0, 30).toLowerCase()}`;
-          if (!seen.has(key)) {
-            seen.add(key);
-            const isTotallyDifferent = similarity < 0.2;
-            const isPartialMismatch = similarity >= 0.2;
-            issues.push({
-              issueNumber: num++, category: 'Content',
-              severity: isTotallyDifferent ? 'critical' : 'major',
-              title: isTotallyDifferent
-                ? `Text is incorrect — ${fn.name || 'text element'}`
-                : `Text content differs — ${fn.name || 'text element'}`,
-              description: isTotallyDifferent
-                ? `The text "${figText.slice(0, 50)}" from Figma was not found. Live site shows "${liveText.slice(0, 50)}" instead.`
-                : `Text partially differs from Figma design. Expected "${figText.slice(0, 50)}", found "${liveText.slice(0, 50)}".`,
-              location: fn.name || `Text at (${fn.box.x | 0},${fn.box.y | 0})`,
-              figmaValue: `"${figText.slice(0, 70)}"`,
-              liveValue: `"${liveText.slice(0, 70)}"`,
-              boundingBox: bx,
-              property: 'text-content',
-            });
-          }
-        }
-      } else if (figText.length > 3 && !liveText) {
-        // Figma has text but live element has no text at all
-        const key = `txt_missing_${figText.slice(0, 20).toLowerCase()}`;
-        if (!seen.has(key)) {
-          seen.add(key);
-          issues.push({
-            issueNumber: num++, category: 'Content',
-            severity: 'critical',
-            title: `Text missing — ${fn.name || 'text element'}`,
-            description: `The text "${figText.slice(0, 50)}" from Figma is missing on the live site.`,
-            location: fn.name || `Text at (${fn.box.x | 0},${fn.box.y | 0})`,
-            figmaValue: `"${figText.slice(0, 70)}"`,
-            liveValue: '(empty / not found)',
-            boundingBox: bx,
-            property: 'text-content',
-          });
-        }
-      }
-    }
-  }
-  return issues;
-}
-
-/* ─── Layer 3: Chunked pixel diff — full height, no gaps ────────────────── */
-// CRITICAL FIX: we use MAX(liveH, figmaH) as the comparison height.
-// Whichever image is shorter is padded with a contrasting fill (magenta) so
-// every pixel of the taller image gets compared instead of being silently dropped.
-const CHUNK_H = 2000;  // pixels per strip — keeps RAM constant
-const PAD_FILL = [255, 0, 255, 255]; // magenta = guaranteed diff pixel
-
-async function runPixelDiff(livePngBuf, figmaBuf) {
-  const parsePng = buf => new Promise((res, rej) => { const p = new PNG(); p.parse(buf, (e, d) => e ? rej(e) : res(d)); });
-
-  const livePng = await parsePng(livePngBuf);
-  let figmaPng;
-  try { figmaPng = await parsePng(figmaBuf); }
-  catch {
-    const j = await Jimp.fromBuffer(figmaBuf);
-    const pngBuf = await j.getBuffer('image/png');
-    figmaPng = await parsePng(pngBuf);
-  }
-
-  // Normalize both images to the same width (1440px) to prevent width mismatch noise
-  const TARGET_W = 1440;
-  if (livePng.width !== TARGET_W) {
-    const j = await Jimp.fromBuffer(Buffer.from(PNG.sync.write(livePng)));
-    j.resize({ w: TARGET_W, h: Math.round(livePng.height * (TARGET_W / livePng.width)) });
-    const resized = await parsePng(await j.getBuffer('image/png'));
-    Object.assign(livePng, resized);
-  }
-  if (figmaPng.width !== TARGET_W) {
-    const j = await Jimp.fromBuffer(Buffer.from(PNG.sync.write(figmaPng)));
-    j.resize({ w: TARGET_W, h: Math.round(figmaPng.height * (TARGET_W / figmaPng.width)) });
-    const resized = await parsePng(await j.getBuffer('image/png'));
-    Object.assign(figmaPng, resized);
-  }
-  const W = TARGET_W;
-  const liveH = livePng.height;
-  const figmaH = figmaPng.height;
-  const H = Math.max(liveH, figmaH);
-  const layoutDivergence = Math.round((Math.abs(liveH - figmaH) / H) * 100);
-
-  console.log(`[MatchDesign] Pixel diff: ${W}x${H}px (live=${liveH}px figma=${figmaH}px) in ${Math.ceil(H / CHUNK_H)} chunk(s)`);
-
-  // Extract RGBA strip — pads with PAD_FILL if strip extends beyond image height
-  const getStrip = async (pngData, yStart, yEnd, targetW) => {
-    const stripH = yEnd - yStart;
-    const actualH = Math.max(0, Math.min(pngData.height - yStart, stripH)); // real pixels available
-    const buf = Buffer.alloc(targetW * stripH * 4, 0);
-
-    if (actualH > 0) {
-      // Write PNG to buffer then use Jimp to crop+resize only the real section
-      const rawBuf = Buffer.from(PNG.sync.write(pngData));
-      const j = await Jimp.fromBuffer(rawBuf);
-      j.crop({ x: 0, y: yStart, w: Math.min(pngData.width, targetW + 10), h: actualH });
-      j.resize({ w: targetW, h: actualH }); // resize ONLY the real part
-
-      for (let y = 0; y < actualH; y++) {
-        for (let x = 0; x < targetW; x++) {
-          const i = (y * targetW + x) * 4;
-          const hex = j.getPixelColor(x, y);
-          buf[i]     = (hex >>> 24) & 0xff;
-          buf[i + 1] = (hex >>> 16) & 0xff;
-          buf[i + 2] = (hex >>>  8) & 0xff;
-          buf[i + 3] =  hex         & 0xff;
-        }
-      }
-    }
-
-    // Pad the remaining rows with contrasting color (guaranteed diff)
-    for (let y = actualH; y < stripH; y++) {
-      for (let x = 0; x < targetW; x++) {
-        const i = (y * targetW + x) * 4;
-        buf[i] = PAD_FILL[0]; buf[i+1] = PAD_FILL[1]; buf[i+2] = PAD_FILL[2]; buf[i+3] = PAD_FILL[3];
-      }
-    }
-    return buf;
-  };
-
-  let totalDiffPixels = 0;
-  const allClusters = [];
-  const diffStrips = [];
-  // Section heatmap: 10 vertical bands, each gets a match %
-  const SECTIONS = 10;
-  const sectionDiffPixels = new Array(SECTIONS).fill(0);
-  const sectionTotalPixels = new Array(SECTIONS).fill(0);
-
-  for (let yStart = 0; yStart < H; yStart += CHUNK_H) {
-    const yEnd = Math.min(yStart + CHUNK_H, H);
-    const stripH = yEnd - yStart;
-
-    const [liveRGBA, figmaRGBA] = await Promise.all([
-      getStrip(livePng, yStart, yEnd, W),
-      getStrip(figmaPng, yStart, yEnd, W),
-    ]);
-
-    const diffBuf = Buffer.alloc(W * stripH * 4);
-    const numDiff = pixelmatch(liveRGBA, figmaRGBA, diffBuf, W, stripH, {
-      threshold: 0.22,  // very tolerant — ignore rendering variance and subtle differences
-      includeAA: false,
-      alpha: 0.1,
-    });
-    totalDiffPixels += numDiff;
-
-    // Accumulate section heatmap
-    for (let row = 0; row < stripH; row++) {
-      const absY = yStart + row;
-      const sectionIdx = Math.min(SECTIONS - 1, Math.floor((absY / H) * SECTIONS));
-      for (let col = 0; col < W; col++) {
-        const i = (row * W + col) * 4;
-        sectionTotalPixels[sectionIdx]++;
-        // pixelmatch marks diff pixels with non-zero alpha in the output
-        if (diffBuf[i + 3] > 10 || (diffBuf[i] > 100 && diffBuf[i+1] < 50)) {
-          sectionDiffPixels[sectionIdx]++;
-        }
-      }
-    }
-
-    // Collect clusters from this strip, offset y back to full-image coordinates
-    const stripClusters = clusterDiffRegions(diffBuf, W, stripH);
-    for (const c of stripClusters) {
-      const absYPct = Math.round(((yStart + (c.y / 100) * stripH) / H) * 100);
-      const absHPct = Math.max(1, Math.round((c.height / 100) * (stripH / H) * 100));
-      allClusters.push({ ...c, y: absYPct, height: absHPct });
-    }
-
-    const diffPngStrip = new PNG({ width: W, height: stripH });
-    diffBuf.copy(diffPngStrip.data);
-    diffStrips.push({ y: yStart, strip: diffPngStrip });
-  }
-
-  const matchPct = Math.max(0, Math.min(100, Math.round((1 - totalDiffPixels / (W * H)) * 100)));
-
-  // Per-section match scores (10 bands, top→bottom)
-  const sectionScores = sectionTotalPixels.map((total, i) =>
-    total === 0 ? 100 : Math.max(0, Math.min(100, Math.round((1 - sectionDiffPixels[i] / total) * 100)))
-  );
-
-  // Assemble output diff image (cap at 6000px height for payload)
-  const outH = Math.min(H, 6000);
-  const fullDiffPng = new PNG({ width: W, height: outH });
-  for (const { y, strip } of diffStrips) {
-    if (y >= outH) break;
-    const copyH = Math.min(strip.height, outH - y);
-    strip.data.copy(fullDiffPng.data, y * W * 4, 0, copyH * W * 4);
-  }
-  const diffBase64 = PNG.sync.write(fullDiffPng).toString('base64');
-
-  // Merge adjacent clusters (prevent cluster explosion on totally different pages)
-  const mergedClusters = mergeClusters(allClusters);
-
-  return { matchPct, diffBase64, clusters: mergedClusters.slice(0, 50), W, H, sectionScores, layoutDivergence };
-}
-
-// Merge clusters that are vertically AND horizontally overlapping (within 1% proximity)
-// Tighter proximity to avoid merging unrelated diff regions into giant boxes
-function mergeClusters(clusters) {
-  if (clusters.length === 0) return [];
-  const sorted = [...clusters].sort((a, b) => a.y - b.y);
-  const merged = [sorted[0]];
-  for (let i = 1; i < sorted.length; i++) {
-    const last = merged[merged.length - 1];
-    const cur = sorted[i];
-    // Only merge if vertically very close AND horizontally overlapping
-    const vertClose = cur.y <= last.y + last.height + 1;
-    const horizOverlap = cur.x < last.x + last.width + 3 && cur.x + cur.width > last.x - 3;
-    if (vertClose && horizOverlap) {
-      const newBottom = Math.max(last.y + last.height, cur.y + cur.height);
-      last.x = Math.min(last.x, cur.x);
-      last.width = Math.min(100, Math.max(last.x + last.width, cur.x + cur.width) - last.x);
-      last.height = newBottom - last.y;
-    } else {
-      merged.push({ ...cur });
-    }
-  }
-  // Cap any oversized cluster — split into smaller pieces if needed
-  const capped = [];
-  for (const c of merged) {
-    if (c.width > 45 && c.height > 20) {
-      // Split into 2 halves vertically
-      const half = Math.floor(c.height / 2);
-      capped.push({ x: c.x, y: c.y, width: c.width, height: half });
-      capped.push({ x: c.x, y: c.y + half, width: c.width, height: c.height - half });
-    } else {
-      // Cap dimensions
-      capped.push({ ...c, width: Math.min(45, c.width), height: Math.min(20, c.height) });
-    }
-  }
-  return capped;
-}
-
-/* ─── Cluster diff pixels → bounding boxes ──────────────────────────────── */
-// Uses density filtering: a block must have ≥15% diff pixels to count as "different".
-// This prevents noise from slight offsets/spacing from creating false highlights.
-function clusterDiffRegions(diffBuf, W, H) {
-  const BLOCK = 100; // large blocks = coarse grid, much less noise sensitivity
-  const MAX_CLUSTER_BLOCKS = 50; // prevent one cluster from swallowing the page
-  const MIN_CLUSTER_BLOCKS = 5;  // ignore scattered noise — need significant area
-  const DENSITY_THRESHOLD = 0.25; // block must have ≥25% diff pixels to be flagged
-  const cols = Math.ceil(W / BLOCK), rows = Math.ceil(H / BLOCK);
-  const blockDiffCounts = new Uint32Array(cols * rows);
-  const blockTotalPixels = new Uint32Array(cols * rows);
-
-  // Count diff pixels per block (not just a binary flag)
-  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
-    const bx = Math.floor(x / BLOCK), by = Math.floor(y / BLOCK);
-    const bIdx = by * cols + bx;
-    blockTotalPixels[bIdx]++;
-    const i = (y * W + x) * 4;
-    if (diffBuf[i] > 100 && diffBuf[i + 1] < 50) { // red pixel = diff
-      blockDiffCounts[bIdx]++;
-    }
-  }
-
-  // Convert to binary with density filter
-  const blocks = new Uint8Array(cols * rows);
-  for (let idx = 0; idx < cols * rows; idx++) {
-    if (blockTotalPixels[idx] > 0 && (blockDiffCounts[idx] / blockTotalPixels[idx]) >= DENSITY_THRESHOLD) {
-      blocks[idx] = 1;
-    }
-  }
-
-  const clusters = [];
-  const visited = new Uint8Array(cols * rows);
-  for (let by = 0; by < rows; by++) for (let bx = 0; bx < cols; bx++) {
-    if (!blocks[by * cols + bx] || visited[by * cols + bx]) continue;
-    // Flood fill with size limit
-    const queue = [[bx, by]], inCluster = [[bx, by]];
-    visited[by * cols + bx] = 1;
-    while (queue.length && inCluster.length < MAX_CLUSTER_BLOCKS) {
-      const [cx, cy] = queue.shift();
-      // 4-directional only (not 8-dir) — prevents diagonal cascade
-      for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
-        const nx = cx + dx, ny = cy + dy;
-        if (nx < 0 || nx >= cols || ny < 0 || ny >= rows) continue;
-        if (visited[ny * cols + nx] || !blocks[ny * cols + nx]) continue;
-        if (inCluster.length >= MAX_CLUSTER_BLOCKS) break;
-        visited[ny * cols + nx] = 1; queue.push([nx, ny]); inCluster.push([nx, ny]);
-      }
-    }
-    // Skip clusters that are too small (noise)
-    if (inCluster.length < MIN_CLUSTER_BLOCKS) continue;
-    const minBX = Math.min(...inCluster.map(c => c[0]));
-    const maxBX = Math.max(...inCluster.map(c => c[0]));
-    const minBY = Math.min(...inCluster.map(c => c[1]));
-    const maxBY = Math.max(...inCluster.map(c => c[1]));
-    clusters.push({
-      x: Math.round(((minBX * BLOCK) / W) * 100),
-      y: Math.round(((minBY * BLOCK) / H) * 100),
-      width: Math.min(45, Math.round((((maxBX - minBX + 1) * BLOCK) / W) * 100)),
-      height: Math.min(20, Math.max(1, Math.round((((maxBY - minBY + 1) * BLOCK) / H) * 100))),
-    });
-  }
-  return clusters;
-}
-
-/* ─── Merge CSS + pixel issues into final mismatch list ─────────────────── */
-function describePixelRegion(box) {
-  const vPos = box.y < 15 ? 'top/header' : box.y < 40 ? 'upper' : box.y < 65 ? 'middle' : box.y < 85 ? 'lower' : 'bottom/footer';
-  const hPos = box.x < 30 ? 'left side' : box.x > 60 ? 'right side' : 'center';
-  const size = box.width * box.height;
-  if (size > 400) return { title: `Major layout difference in ${vPos} area`, desc: `A large visual difference was detected in the ${vPos} ${hPos} of the page. This may indicate a missing section, significantly different component, or major color/layout change.`, sev: 'critical' };
-  if (size > 100) return { title: `Visual mismatch in ${vPos} area`, desc: `A noticeable visual difference was found in the ${vPos} ${hPos}. Check for incorrect colors, different text, missing icons, or spacing issues.`, sev: 'major' };
-  return { title: `Minor visual difference in ${vPos} area`, desc: `A small visual difference in the ${vPos} ${hPos}. Could be a color shade, border, or small element difference.`, sev: 'minor' };
-}
-
-function buildMismatches(cssIssues, pixelClusters, startNum) {
-  const pixelIssues = pixelClusters.map((box, i) => {
-    const info = describePixelRegion(box);
-    return {
-      issueNumber: startNum + i,
-      category: 'Layout',
-      severity: info.sev,
-      title: info.title,
-      description: info.desc,
-      location: `Page region at ~${box.y}% from top, ~${box.x}% from left`,
-      figmaValue: 'Compare with Figma design',
-      liveValue: 'Differs from expected design',
-      boundingBox: box,
-    };
-  });
-  return [...cssIssues, ...pixelIssues];
-}
-
-/* ─── Score + structural analysis ───────────────────────────────────────── */
-function computeScores(matchPct, cssIssueCount, layoutDivergence = 0, sectionScores = []) {
-  const cssPenalty = Math.min(30, cssIssueCount * 3);
-  const matchScore = Math.max(0, Math.min(100, Math.round(matchPct - cssPenalty)));
-
-  // Honest projected score: we can only fix CSS/style issues, not layout restructuring
-  // If the pages are structurally divergent, projected improvement is bounded
-  const structuralDivergence = layoutDivergence + (matchPct < 30 ? 40 : matchPct < 50 ? 20 : 0);
-  const fixable = Math.min(cssPenalty + 10, 100 - matchScore); // realistic fixable margin
-  const projectedScore = Math.min(100, Math.round(matchScore + fixable));
-
-  // Classification
   let verdict, verdictDetail;
   if (matchScore >= 85) {
     verdict = 'excellent';
-    verdictDetail = 'Minor polish needed — colours or spacing are slightly off.';
+    verdictDetail = 'Minor polish needed â€” colours or spacing are slightly off.';
   } else if (matchScore >= 65) {
     verdict = 'good';
     verdictDetail = 'Several style mismatches detected. CSS fixes should bring this close to design.';
@@ -677,41 +84,66 @@ function computeScores(matchPct, cssIssueCount, layoutDivergence = 0, sectionSco
     verdictDetail = 'Significant differences found. Some sections match; others need layout work.';
   } else if (matchScore >= 15) {
     verdict = 'divergent';
-    verdictDetail = 'Pages are structurally very different. This likely requires a layout redesign, not just CSS fixes.';
+    verdictDetail = 'Pages are structurally very different. Layout redesign likely needed.';
   } else {
     verdict = 'unrelated';
-    verdictDetail = 'These pages appear to be completely different designs. Pixel similarity is near 0%. A full redesign is needed.';
+    verdictDetail = 'These pages appear completely different. A full redesign is needed.';
   }
 
-  // Worst-performing section (for actionable callout)
-  let worstSection = null;
-  if (sectionScores.length > 0) {
-    const minScore = Math.min(...sectionScores);
-    const minIdx = sectionScores.indexOf(minScore);
-    worstSection = { sectionIndex: minIdx, matchPct: minScore, label: sectionLabel(minIdx, sectionScores.length) };
+  return { matchScore, projectedScore, verdict, verdictDetail };
+}
+
+/* â”€â”€â”€ VLM fallback for complex elements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+async function vlmFallbackCheck(liveBuf, figmaBuf, complexDrifts) {
+  // Only run for elements where spatial matching was weak
+  if (complexDrifts.length === 0) return [];
+  try {
+    const { GoogleGenerativeAI } = require('@google/generative-ai');
+    const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+    const model = genAI.getGenerativeModel({ model: 'gemini-2.0-flash' });
+
+    const result = await model.generateContent([
+      {
+        inlineData: { mimeType: 'image/png', data: liveBuf.toString('base64') }
+      },
+      {
+        inlineData: { mimeType: 'image/png', data: figmaBuf.toString('base64') }
+      },
+      `Compare these two UI screenshots. The first is the live website, the second is the Figma design.
+Identify up to 5 major visual differences that automated comparison might miss (complex SVGs, icons, images, gradients).
+Return ONLY valid JSON array:
+[{"title":"...","description":"...","severity":"critical|major|minor","category":"visual","boundingBox":{"x":0,"y":0,"width":100,"height":10}}]
+boundingBox values are percentages of the image. Be concise.`
+    ]);
+
+    const text = result.response.text().trim().replace(/^```json\s*/i, '').replace(/\s*```\s*$/, '');
+    const match = text.match(/\[[\s\S]*\]/);
+    if (match) {
+      const items = JSON.parse(match[0]);
+      return items.slice(0, 5).map((item, i) => ({
+        ...item,
+        issueNumber: 900 + i,
+        property: 'visual',
+        expected: 'See Figma design',
+        actual: 'See live site',
+        delta: 0,
+        matchConfidence: 0,
+        figmaName: 'VLM detected',
+        domSelector: '',
+      }));
+    }
+  } catch (e) {
+    console.log('[MatchDesign] VLM fallback skipped:', e.message);
   }
-
-  return { matchScore, projectedScore, verdict, verdictDetail, worstSection };
+  return [];
 }
 
-function sectionLabel(idx, total) {
-  const pct = Math.round((idx / total) * 100);
-  if (pct < 10) return 'Top (Hero / Header)';
-  if (pct < 25) return 'Upper section';
-  if (pct < 45) return 'Mid-upper section';
-  if (pct < 55) return 'Middle';
-  if (pct < 70) return 'Mid-lower section';
-  if (pct < 85) return 'Lower section';
-  return 'Bottom (Footer)';
-}
-
-/* ─── Main handler ───────────────────────────────────────────────────────── */
+/* â”€â”€â”€ Main handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const matchDesign = async (req, res) => {
   const { websiteUrl, figmaUrl } = req.body;
   if (!websiteUrl || !figmaUrl)
     return res.status(400).json({ success: false, message: 'Both website URL and Figma URL are required.' });
 
-  // Resolve Figma token: user's own token takes priority over env
   const uid = req.user?.uid;
   let figmaToken = process.env.FIGMA_API_TOKEN;
   try {
@@ -720,44 +152,77 @@ const matchDesign = async (req, res) => {
   } catch { /* use env fallback */ }
 
   if (!figmaToken)
-    return res.status(400).json({ success: false, message: 'No Figma token configured. Add yours in Settings.' });
+    return res.status(400).json({ success: false, message: 'No Figma token configured.' });
 
   try {
-    console.log('[MatchDesign] Step 1/4 — Screenshot:', websiteUrl);
-    const [livePngBuf, liveStyles] = await Promise.all([
-      freezeAndScreenshot(websiteUrl),
-      extractLiveStyles(websiteUrl),
-    ]);
+    // â”€â”€ Phase 1: Ingestion & Viewport Synchronization â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    console.log('[MatchDesign] Phase 1 â€” Ingesting Figma:', figmaUrl);
+    const { figmaBuf, nodeDoc, frameWidth, frameHeight } = await ingestFigma(figmaUrl, figmaToken);
 
-    console.log('[MatchDesign] Step 2/4 — Fetching Figma:', figmaUrl);
-    const { figmaBuf, figmaNodes } = await fetchFigmaData(figmaUrl, figmaToken);
+    console.log(`[MatchDesign] Phase 1 â€” Ingesting live site at ${frameWidth}Ã—${frameHeight}:`, websiteUrl);
+    const { screenshotBuf, domElements } = await ingestLiveSite(websiteUrl, frameWidth, frameHeight);
 
-    console.log('[MatchDesign] Step 3/4 — Pixel diff...');
-    const { matchPct, diffBase64, clusters, W, H, sectionScores, layoutDivergence } = await runPixelDiff(livePngBuf, figmaBuf);
+    // â”€â”€ Phase 2+3+4: Spatial Comparison â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    console.log('[MatchDesign] Phases 2-4 â€” Spatial comparison...');
+    const { drifts, stats, overallScore } = runSpatialComparison(
+      nodeDoc, domElements, frameWidth, frameHeight
+    );
 
-    console.log('[MatchDesign] Step 4/4 — CSS tokens...');
-    const livePng = PNG.sync.read(livePngBuf);
-    const cssIssues = compareStyles(liveStyles, figmaNodes, 1440, livePng.height || 5000);
+    // â”€â”€ Pixel diff (backup layer) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    console.log('[MatchDesign] Running pixel diff backup...');
+    const pixelResult = await runPixelDiff(screenshotBuf, figmaBuf);
+    const pixelPct = pixelResult?.matchPct ?? 50;
+    const diffBase64 = pixelResult?.diffBase64 ?? '';
 
-    const allMismatches = buildMismatches(cssIssues, clusters, cssIssues.length + 1);
-    allMismatches.forEach((m, i) => { m.issueNumber = i + 1; });
+    // â”€â”€ VLM fallback for complex visual elements â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const vlmDrifts = await vlmFallbackCheck(screenshotBuf, figmaBuf,
+      drifts.filter(d => d.category === 'missing'));
 
-    const { matchScore, projectedScore, verdict, verdictDetail, worstSection } =
-      computeScores(matchPct, cssIssues.length, layoutDivergence, sectionScores);
+    // â”€â”€ Phase 5: Build final output â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const allDrifts = [...drifts, ...vlmDrifts];
+    // Re-number
+    allDrifts.forEach((d, i) => { d.issueNumber = i + 1; });
 
-    console.log(`[MatchDesign] Done. Pixel: ${matchPct}%, Score: ${matchScore}% (${verdict}), Issues: ${allMismatches.length}`);
+    // Build backward-compatible mismatches array
+    const mismatches = allDrifts.map(d => ({
+      issueNumber: d.issueNumber,
+      category: (d.category || 'Layout').charAt(0).toUpperCase() + (d.category || 'layout').slice(1),
+      severity: d.severity || 'minor',
+      title: d.title,
+      description: d.description,
+      location: d.figmaName || d.domSelector || 'Unknown',
+      figmaValue: d.expected || 'N/A',
+      liveValue: d.actual || 'N/A',
+      boundingBox: d.boundingBox,
+      property: d.property,
+      delta: d.delta,
+      matchConfidence: d.matchConfidence,
+    }));
 
-    // ── Persist scan to DB (async, don't block response) ──────────────────
-    const websiteB64 = livePngBuf.toString('base64');
-    const figmaB64   = figmaBuf.toString('base64');
+    const critCount = mismatches.filter(m => m.severity === 'critical').length;
+    const majCount = mismatches.filter(m => m.severity === 'major').length;
+
+    const { matchScore, projectedScore, verdict, verdictDetail } =
+      computeScores(pixelPct, overallScore, mismatches.length, critCount, majCount);
+
+    // Section scores from spatial stats
+    const sectionScores = buildSectionScores(drifts, frameHeight);
+    const worstSection = findWorstSection(sectionScores);
+    const layoutDivergence = Math.round(Math.abs(stats.missingElements / Math.max(1, stats.figmaElementCount)) * 100);
+
+    console.log(`[MatchDesign] Done. Score: ${matchScore}% (${verdict}), Drifts: ${mismatches.length}, Pixel: ${pixelPct}%`);
+    console.log(`[MatchDesign] Stats: ${stats.matchedPairs} matched, ${stats.missingElements} missing, ${stats.extraElements} extra`);
+
+    // â”€â”€ Persist to DB â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    const websiteB64 = screenshotBuf.toString('base64');
+    const figmaB64 = figmaBuf.toString('base64');
     let savedScanId = null;
     try {
       const saved = await DesignScan.create({
-        userId: uid,
-        websiteUrl, figmaUrl,
-        matchScore, projectedScore, pixelMatchPercent: matchPct,
+        userId: uid, websiteUrl, figmaUrl,
+        matchScore, projectedScore, pixelMatchPercent: pixelPct,
         layoutDivergence, verdict, verdictDetail, sectionScores, worstSection,
-        totalIssues: allMismatches.length, mismatches: allMismatches,
+        totalIssues: mismatches.length, mismatches,
         websiteScreenshotBase64: websiteB64,
         figmaScreenshotBase64: figmaB64,
         diffImageBase64: diffBase64,
@@ -765,20 +230,19 @@ const matchDesign = async (req, res) => {
       });
       savedScanId = saved._id;
     } catch (dbErr) {
-      console.error('[MatchDesign] DB save failed (non-fatal):', dbErr.message);
+      console.error('[MatchDesign] DB save failed:', dbErr.message);
     }
 
     return res.status(200).json({
-      success: true,
-      scanId: savedScanId,
-      mismatches: allMismatches,
-      totalIssues: allMismatches.length,
+      success: true, scanId: savedScanId,
+      mismatches, totalIssues: mismatches.length,
       matchScore, projectedScore, verdict, verdictDetail,
-      pixelMatchPercent: matchPct, layoutDivergence, sectionScores, worstSection,
+      pixelMatchPercent: pixelPct, layoutDivergence, sectionScores, worstSection,
       websiteUrl, figmaUrl,
       websiteScreenshotBase64: websiteB64,
       figmaScreenshotBase64: figmaB64,
       diffImageBase64: diffBase64,
+      spatialStats: stats,
     });
 
   } catch (error) {
@@ -787,54 +251,63 @@ const matchDesign = async (req, res) => {
   }
 };
 
-/* ─── GET /api/match-design/history ─────────────────────────────────────── */
+/* ──── Section scores (10 vertical bands) ───────────────────────────────────────── */
+function buildSectionScores(drifts, pageHeight) {
+  const SECTIONS = 10;
+  const sectionDrifts = new Array(SECTIONS).fill(0);
+  for (const d of drifts) {
+    if (!d.boundingBox) continue;
+    const midY = d.boundingBox.y + d.boundingBox.height / 2;
+    const idx = Math.min(SECTIONS - 1, Math.floor((midY / 100) * SECTIONS));
+    const weight = d.severity === 'critical' ? 3 : d.severity === 'major' ? 2 : 1;
+    sectionDrifts[idx] += weight;
+  }
+  const maxDrift = Math.max(1, ...sectionDrifts);
+  return sectionDrifts.map(d => Math.max(0, Math.min(100, Math.round(100 - (d / maxDrift) * 80))));
+}
+
+function findWorstSection(scores) {
+  if (!scores.length) return null;
+  const minScore = Math.min(...scores);
+  const idx = scores.indexOf(minScore);
+  const labels = ['Top (Hero/Header)', 'Upper section', '', 'Mid-upper', '', 'Middle', '', 'Mid-lower', 'Lower section', 'Bottom (Footer)'];
+  return { sectionIndex: idx, matchPct: minScore, label: labels[idx] || `Section ${idx + 1}` };
+}
+
+/* â”€â”€â”€ CRUD endpoints (unchanged) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const getDesignHistory = async (req, res) => {
   try {
     const uid = req.user?.uid;
     const scans = await DesignScan.find({ userId: uid })
-      .sort({ createdAt: -1 })
-      .limit(30)
+      .sort({ createdAt: -1 }).limit(30)
       .select('-websiteScreenshotBase64 -figmaScreenshotBase64 -diffImageBase64 -mismatches');
     return res.json({ success: true, scans });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
-  }
+  } catch (err) { return res.status(500).json({ success: false, message: err.message }); }
 };
 
-/* ─── GET /api/match-design/:scanId ──────────────────────────────────────── */
 const getDesignScan = async (req, res) => {
   try {
     const uid = req.user?.uid;
     const scan = await DesignScan.findOne({ _id: req.params.scanId, userId: uid });
     if (!scan) return res.status(404).json({ success: false, message: 'Scan not found.' });
     return res.json({ success: true, scan });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
-  }
+  } catch (err) { return res.status(500).json({ success: false, message: err.message }); }
 };
 
-/* ─── DELETE /api/match-design/:scanId ───────────────────────────────────── */
 const deleteDesignScan = async (req, res) => {
   try {
     const uid = req.user?.uid;
     await DesignScan.deleteOne({ _id: req.params.scanId, userId: uid });
     return res.json({ success: true });
-  } catch (err) {
-    return res.status(500).json({ success: false, message: err.message });
-  }
+  } catch (err) { return res.status(500).json({ success: false, message: err.message }); }
 };
 
-/* ─────────────────────────────────────────────────────────────────────────────
-   generateDesignFix
-   POST /api/match-design/fix
-   Body: { mismatches, websiteUrl, repoFullName, githubToken }
-   Maps design mismatches to source files and generates CSS/style fix diffs
-──────────────────────────────────────────────────────────────────────────────*/
+/* ─── Fix Generation ─────────────────────────────────────────────────────── */
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const FixSession = require('../models/FixSession');
 const { getUserOctokit } = require('./githubController');
 
-/* ─── Framework detection ─────────────────────────────────────────────────── */
+/* â”€â”€â”€ Framework detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function detectFrameworkFromTree(tree, pkgJson) {
   const paths = tree.map(f => f.path.toLowerCase());
   const deps = { ...(pkgJson?.dependencies || {}), ...(pkgJson?.devDependencies || {}) };
@@ -849,7 +322,7 @@ function detectFrameworkFromTree(tree, pkgJson) {
   return 'css';
 }
 
-/* ─── File selection — scoring approach (mirrors fixController.selectFilesToFetch) ── */
+/* â”€â”€â”€ File selection â€” scoring approach (mirrors fixController.selectFilesToFetch) â”€â”€ */
 function selectFilesForDesignFix(tree, framework) {
   const SKIP = /(node_modules|\.git|\.next|dist|build|out|__pycache__|\.cache)\//i;
   const SOURCE_EXT = /\.(jsx?|tsx?|html?|vue|svelte|css|scss|sass|less)$/i;
@@ -861,23 +334,23 @@ function selectFilesForDesignFix(tree, framework) {
     let score = 0;
     const p = f.path.toLowerCase();
 
-    // Component / page files — highest relevance
+    // Component / page files â€” highest relevance
     if (p.includes('component')) score += 20;
-    if (p.includes('page'))      score += 18;
-    if (p.includes('layout'))    score += 18;
+    if (p.includes('page')) score += 18;
+    if (p.includes('layout')) score += 18;
     if (p.includes('header') || p.includes('nav') || p.includes('footer')) score += 15;
     if (p.includes('hero') || p.includes('banner') || p.includes('section')) score += 12;
     if (p.includes('card') || p.includes('button') || p.includes('sidebar')) score += 10;
-    if (p.includes('form') || p.includes('input') || p.includes('modal'))  score += 8;
+    if (p.includes('form') || p.includes('input') || p.includes('modal')) score += 8;
     if (p.includes('home') || p.includes('landing') || p.includes('main')) score += 15;
-    if (p.includes('app'))       score += 10;
-    if (p.includes('index'))     score += 8;
+    if (p.includes('app')) score += 10;
+    if (p.includes('index')) score += 8;
 
-    // Style files — always relevant for design fixes
+    // Style files â€” always relevant for design fixes
     if (p.endsWith('.css') || p.endsWith('.scss') || p.endsWith('.sass') || p.endsWith('.less')) score += 20;
     if (p.includes('global') || p.includes('style') || p.includes('theme')) score += 18;
-    if (p.includes('variable') || p.includes('_var'))  score += 12;
-    if (p.includes('tailwind.config'))                 score += 25;
+    if (p.includes('variable') || p.includes('_var')) score += 12;
+    if (p.includes('tailwind.config')) score += 25;
     if (p.includes('module.css') || p.includes('module.scss')) score += 15;
 
     // Extension bonuses
@@ -902,7 +375,7 @@ function selectFilesForDesignFix(tree, framework) {
     .map(f => f.path);
 }
 
-/* ─── Diff generator ─────────────────────────────────────────────────────── */
+/* â”€â”€â”€ Diff generator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function generateDesignDiff(original, fixed, filePath) {
   if (original === fixed) return '';
   const origLines = original.split('\n'), fixedLines = fixed.split('\n');
@@ -918,7 +391,7 @@ function generateDesignDiff(original, fixed, filePath) {
   return diff.join('\n');
 }
 
-/* ─── Fuzzy replace (from fixController) ─────────────────────────────────── */
+/* â”€â”€â”€ Fuzzy replace (from fixController) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function fuzzyReplace(fileContent, originalCode, fixedCode) {
   if (fileContent.includes(originalCode)) return fileContent.replace(originalCode, fixedCode);
   const origLines = originalCode.split('\n').map(l => l.trim()).filter(l => l);
@@ -935,20 +408,20 @@ function fuzzyReplace(fileContent, originalCode, fixedCode) {
   return fileContent;
 }
 
-const MAX_FULL_FILE = 40000; // chars — match sourceMapper limit
+const MAX_FULL_FILE = 40000; // chars â€” match sourceMapper limit
 
 const FRAMEWORK_HINTS = {
-  'nextjs-tailwind':  'Next.js + Tailwind CSS. Fix via tailwind.config.js theme values, globals.css, or updating className strings in .tsx/.jsx files.',
-  'react-tailwind':   'React + Tailwind CSS. Fix via tailwind.config.js theme values or className strings in JSX.',
-  'nextjs-styled':    'Next.js + styled-components/emotion. Fix the styled component definitions.',
-  'nextjs-css':       'Next.js + CSS Modules. Fix .module.css files and globals.css.',
-  'vue':              'Vue.js project. Fix <style> sections of .vue SFCs or separate CSS files.',
-  'svelte':           'Svelte project. Fix <style> sections of .svelte files.',
-  'react-bootstrap':  'React + Bootstrap. Fix SCSS variable overrides (_variables.scss).',
-  'css':              'Plain CSS/SCSS project. Fix CSS/SCSS files directly.',
+  'nextjs-tailwind': 'Next.js + Tailwind CSS. Fix via tailwind.config.js theme values, globals.css, or updating className strings in .tsx/.jsx files.',
+  'react-tailwind': 'React + Tailwind CSS. Fix via tailwind.config.js theme values or className strings in JSX.',
+  'nextjs-styled': 'Next.js + styled-components/emotion. Fix the styled component definitions.',
+  'nextjs-css': 'Next.js + CSS Modules. Fix .module.css files and globals.css.',
+  'vue': 'Vue.js project. Fix <style> sections of .vue SFCs or separate CSS files.',
+  'svelte': 'Svelte project. Fix <style> sections of .svelte files.',
+  'react-bootstrap': 'React + Bootstrap. Fix SCSS variable overrides (_variables.scss).',
+  'css': 'Plain CSS/SCSS project. Fix CSS/SCSS files directly.',
 };
 
-/* ─── Per-mismatch: find best candidate file ─────────────────────────────── */
+/* â”€â”€â”€ Per-mismatch: find best candidate file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function findBestFileForMismatch(mismatch, repoFiles) {
   const loc = (mismatch.location || '').toLowerCase();
   const cat = (mismatch.category || '').toLowerCase();
@@ -960,7 +433,7 @@ function findBestFileForMismatch(mismatch, repoFiles) {
     const c = f.content.toLowerCase();
     let score = 0;
 
-    // Category-based: style issues → CSS/SCSS, content → JSX/HTML
+    // Category-based: style issues â†’ CSS/SCSS, content â†’ JSX/HTML
     if (['colors', 'typography', 'spacing', 'borders', 'shadows'].includes(cat)) {
       if (p.endsWith('.css') || p.endsWith('.scss') || p.includes('global') || p.includes('style')) score += 15;
       if (p.includes('tailwind.config')) score += 10;
@@ -993,7 +466,7 @@ function findBestFileForMismatch(mismatch, repoFiles) {
   return candidates.filter(c => c.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
 }
 
-/* ─── Per-mismatch Gemini fix call ───────────────────────────────────────── */
+/* â”€â”€â”€ Per-mismatch Gemini fix call â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 async function geminiFixDesignMismatch(mismatch, fileData, framework, websiteUrl, model) {
   const { filePath, content } = fileData;
   const isLarge = content.length > MAX_FULL_FILE;
@@ -1033,7 +506,7 @@ Respond ONLY with this JSON (no markdown, no text outside JSON):
 {
   "bestFile": "${filePath}",
   "confidence": 0-100,
-  "fullFixedContent": "COMPLETE FIXED FILE CONTENT — all lines",
+  "fullFixedContent": "COMPLETE FIXED FILE CONTENT â€” all lines",
   "changeDescription": "one-line summary of what changed"
 }`;
   } else {
@@ -1055,7 +528,7 @@ Framework: ${frameworkHint}
 DESIGN MISMATCH:
 ${mismatchDesc}
 
-FILE: ${filePath} (large file — showing lines ${start + 1}–${end} of ${lines.length})
+FILE: ${filePath} (large file â€” showing lines ${start + 1}â€“${end} of ${lines.length})
 \`\`\`
 ${snippet}
 \`\`\`
@@ -1082,7 +555,7 @@ Fix this mismatch. Return ONLY this JSON:
   }
 }
 
-/* ─── Main handler ───────────────────────────────────────────────────────── */
+/* â”€â”€â”€ Main handler â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 const generateDesignFix = async (req, res) => {
   const { mismatches, websiteUrl, repoFullName } = req.body;
   if (!mismatches?.length || !repoFullName)
@@ -1095,7 +568,7 @@ const generateDesignFix = async (req, res) => {
     const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
     const [owner, repo] = repoFullName.split('/');
 
-    // ── Step 1: Get repo tree + detect framework ────────────────────────────
+    // â”€â”€ Step 1: Get repo tree + detect framework â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const { data: repoMeta } = await octokit.rest.repos.get({ owner, repo });
     const branch = repoMeta.default_branch;
     const { data: treeData } = await octokit.rest.git.getTree({ owner, repo, tree_sha: branch, recursive: 'true' });
@@ -1109,7 +582,7 @@ const generateDesignFix = async (req, res) => {
     const framework = detectFrameworkFromTree(treeData.tree, pkgJson);
     console.log(`[DesignFix] Framework: ${framework}, Repo: ${repoFullName}`);
 
-    // ── Step 2: Select and fetch files (scoring approach, up to 40) ─────────
+    // â”€â”€ Step 2: Select and fetch files (scoring approach, up to 40) â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const filePaths = selectFilesForDesignFix(treeData.tree, framework);
     if (!filePaths.length) return res.status(400).json({ success: false, message: 'No relevant source files found.' });
     console.log(`[DesignFix] Selected ${filePaths.length} files to fetch`);
@@ -1122,8 +595,8 @@ const generateDesignFix = async (req, res) => {
     if (!repoFiles.length) return res.status(400).json({ success: false, message: 'Could not fetch any source files.' });
     console.log(`[DesignFix] Fetched ${repoFiles.length} files`);
 
-    // ── Step 3: Per-mismatch processing (batches of 3, like sourceMapper) ───
-    const fileFixMap = new Map(); // filePath → { content, fixedContent, changes[] }
+    // â”€â”€ Step 3: Per-mismatch processing (batches of 3, like sourceMapper) â”€â”€â”€
+    const fileFixMap = new Map(); // filePath â†’ { content, fixedContent, changes[] }
     const CONCURRENCY = 3;
     const toProcess = mismatches.slice(0, 20); // cap at 20 mismatches
 
@@ -1134,7 +607,7 @@ const generateDesignFix = async (req, res) => {
         const candidates = findBestFileForMismatch(mismatch, repoFiles);
         if (!candidates.length) {
           // Fallback: send file listing to Gemini to pick
-          console.log(`[DesignFix] No candidate for "${mismatch.category}: ${mismatch.description?.slice(0, 40)}" — trying all files`);
+          console.log(`[DesignFix] No candidate for "${mismatch.category}: ${mismatch.description?.slice(0, 40)}" â€” trying all files`);
           // Pick first style file or first component file
           const fallback = repoFiles.find(f =>
             /\.(css|scss)$/i.test(f.filePath) || /global/i.test(f.filePath)
@@ -1196,7 +669,7 @@ const generateDesignFix = async (req, res) => {
       }
     }
 
-    // ── Step 4: Build final mapped files with diffs ─────────────────────────
+    // â”€â”€ Step 4: Build final mapped files with diffs â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const mappedFiles = [...fileFixMap.values()]
       .filter(f => f.fixedContent !== f.content)
       .map(f => ({
@@ -1211,7 +684,7 @@ const generateDesignFix = async (req, res) => {
     if (!mappedFiles.length)
       return res.status(422).json({ success: false, message: 'AI found no actionable changes in the repository files.' });
 
-    // ── Step 5: Persist session ─────────────────────────────────────────────
+    // â”€â”€ Step 5: Persist session â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     const session = await FixSession.create({
       userId: uid, scanId: null, repoFullName, fixType: 'design',
       websiteUrl, framework, mappedFiles, unmappedErrors: [],
