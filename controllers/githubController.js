@@ -79,7 +79,9 @@ const githubCallback = async (req, res) => {
     const octokit = new Octokit({ auth: accessToken });
     const { data: githubUser } = await octokit.rest.users.getAuthenticated();
 
-    // Store token in user profile (upsert in case profile doesn't exist yet)
+    // Store token in user profile.
+    // IMPORTANT: include email in $setOnInsert so the required field
+    // is satisfied when the UserProfile document doesn't exist yet.
     await UserProfile.findOneAndUpdate(
       { uid },
       {
@@ -89,12 +91,20 @@ const githubCallback = async (req, res) => {
           'github.avatarUrl': githubUser.avatar_url,
           'github.connectedAt': new Date(),
         },
+        $setOnInsert: {
+          uid,
+          // Fallback email so the required field is satisfied on first insert.
+          // A real email will be set when the user next calls upsertFromFirebase.
+          email: githubUser.email || `${githubUser.login}@github.placeholder`,
+          displayName: githubUser.name || githubUser.login,
+          photoURL: githubUser.avatar_url,
+        },
       },
       { upsert: true, setDefaultsOnInsert: true }
     );
 
     console.log(`[GitHub] Connected: ${githubUser.login} for uid ${uid}`);
-    res.redirect(`${FRONTEND_URL}/settings?github=connected&username=${githubUser.login}`);
+    res.redirect(`${FRONTEND_URL}/settings?github=connected&username=${encodeURIComponent(githubUser.login)}`);
 
   } catch (err) {
     console.error('[GitHub] Callback error:', err);
