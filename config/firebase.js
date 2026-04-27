@@ -15,6 +15,11 @@ const initFirebase = () => {
   try {
     if (serviceAccountJson) {
       const serviceAccount = JSON.parse(serviceAccountJson);
+      // Cloud platforms (Render, Railway, etc.) sometimes double-escape \n in the
+      // private key when storing JSON as an env var. Normalize to real newlines.
+      if (serviceAccount.private_key) {
+        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+      }
       credential = admin.credential.cert(serviceAccount);
     } else if (serviceAccountPath) {
       // eslint-disable-next-line import/no-dynamic-require

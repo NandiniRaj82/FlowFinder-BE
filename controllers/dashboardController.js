@@ -66,8 +66,8 @@ const getDashboardStats = async (req, res) => {
           $group: {
             _id: null,
             avgAccessibility: { $avg: '$scores.accessibility' },
-            avgPerformance:   { $avg: '$scores.performance' },
-            avgSeo:           { $avg: '$scores.seo' },
+            avgPerformance: { $avg: '$scores.performance' },
+            avgSeo: { $avg: '$scores.seo' },
           },
         },
       ]),
@@ -78,18 +78,18 @@ const getDashboardStats = async (req, res) => {
         {
           $group: {
             _id: null,
-            totalFilesFixed:  { $sum: '$totalFilesChanged' },
+            totalFilesFixed: { $sum: '$totalFilesChanged' },
             totalIssuesFixed: { $sum: '$totalFixesApplied' },
           },
         },
       ]),
     ]);
 
-    const totalErrors      = errorAgg[0]?.totalErrors ?? 0;
+    const totalErrors = errorAgg[0]?.totalErrors ?? 0;
     const avgAccessibility = Math.round(scoreAgg[0]?.avgAccessibility ?? 0);
-    const avgPerformance   = Math.round(scoreAgg[0]?.avgPerformance ?? 0);
-    const avgSeo           = Math.round(scoreAgg[0]?.avgSeo ?? 0);
-    const totalFilesFixed  = fixAgg[0]?.totalFilesFixed ?? 0;
+    const avgPerformance = Math.round(scoreAgg[0]?.avgPerformance ?? 0);
+    const avgSeo = Math.round(scoreAgg[0]?.avgSeo ?? 0);
+    const totalFilesFixed = fixAgg[0]?.totalFilesFixed ?? 0;
     const totalIssuesFixed = fixAgg[0]?.totalIssuesFixed ?? 0;
 
     // Scan breakdown by source
@@ -141,11 +141,11 @@ const getDashboardStats = async (req, res) => {
         // GitHub status
         github: userProfile?.github
           ? {
-              connected: true,
-              username: userProfile.github.username,
-              avatarUrl: userProfile.github.avatarUrl,
-              connectedAt: userProfile.github.connectedAt,
-            }
+            connected: true,
+            username: userProfile.github.username,
+            avatarUrl: userProfile.github.avatarUrl,
+            connectedAt: userProfile.github.connectedAt,
+          }
           : { connected: false },
       },
       recentScans,
