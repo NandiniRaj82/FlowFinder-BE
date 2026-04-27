@@ -304,9 +304,10 @@ const deleteDesignScan = async (req, res) => {
 
 /* ─── Fix Generation ─────────────────────────────────────────────────────── */
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const FixSession = require('../models/FixSession');
-const { getUserOctokit } = require('./githubController');
 
+const FixSession = require('../models/fixSession');
+const { getUserOctokit } = require('./githubController');
+/* added*/
 /* â”€â”€â”€ Framework detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
 function detectFrameworkFromTree(tree, pkgJson) {
   const paths = tree.map(f => f.path.toLowerCase());
