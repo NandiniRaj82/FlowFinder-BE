@@ -304,7 +304,7 @@ const deleteDesignScan = async (req, res) => {
 
 /* ─── Fix Generation ─────────────────────────────────────────────────────── */
 const { GoogleGenerativeAI } = require('@google/generative-ai');
-const FixSession = require('../models/FixSession');
+const FixSession = require('../models/fixSession');
 const { getUserOctokit } = require('./githubController');
 
 /* â”€â”€â”€ Framework detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
