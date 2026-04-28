@@ -1,0 +1,40 @@
+node_modules
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment files — injected at runtime via docker-compose
+.env
+.env.*
+.env.local
+
+# Sensitive config
+config/firebase-service-account.json
+
+# Uploads (mounted as a volume)
+uploads/
+
+# Logs
+logs/
+*.log
+
+# Build artifacts
+dist/
+build/
+
+# Temp
+tmp/
+temp/
+*.tmp
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Git
+.git/
+.gitignore
